@@ -1,0 +1,26 @@
+# One URL per line. Blank lines and lines starting with "#" are ignored.
+# Each URL is fetched and ingested into the same index as data/raw/ files.
+#
+# Prefix a line with "crawl:" to crawl a whole documentation site from
+# one seed URL instead of listing every page by hand. The crawler only
+# follows links that stay under the seed URL's own path (never the
+# rest of the domain) and stops after a page-count cap - see
+# crawl_website() in app/ingestion/loader.py.
+#
+# Prefix a line with "js:" (single page) or "crawl-js:" (whole site)
+# instead if the site renders its content with JavaScript (a
+# single-page app) - the plain "crawl:"/no-prefix fetch only reads the
+# server's raw HTML and gets an empty page for such sites, since it
+# never executes JS. This is slower (renders each page in a real
+# headless browser) so only use it when a site actually needs it.
+#
+# IBM Docs sites (any ibm.com/docs/en/... URL) are auto-detected and
+# crawled via IBM's own internal TOC+content API instead (see
+# crawl_ibm_docs() in app/ingestion/loader.py) rather than the
+# render_js/Playwright path above - their pages are a single-page app
+# whose raw HTML is an empty <div id="app"> shell, and even a headless
+# browser can't reliably render a specific topic's content on a direct
+# page load (the app's router only hydrates the generic hub view), so
+# a plain "crawl:" is all that's needed here despite the site being a
+# JS app - the crawl-js: prefix would also work but is unnecessary.
+crawl:https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas

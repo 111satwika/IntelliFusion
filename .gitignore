@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local vector store and ingested data (regenerable via re-ingestion,
+# and too large / machine-specific to commit).
+data/chroma_db/
+data/raw/
+data/*.log
