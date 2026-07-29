@@ -1,9 +1,9 @@
 """Tests for app.ingestion.ingest.
 
-chunk_document, embed_chunks, and add_embedded_chunks are all faked
-out here so this only verifies ingest.py's own logic: discovering
-files by extension, using the right loader for each, flattening
-single-Document vs list[Document] loader results, skipping
+chunk_with_parent_child, embed_chunks, and add_embedded_chunks are
+all faked out here so this only verifies ingest.py's own logic:
+discovering files by extension, using the right loader for each,
+flattening single-Document vs list[Document] loader results, skipping
 unsupported file types, reading URLs from a urls file, and skipping
 unreachable URLs - without the cost of loading a real embedding model,
 touching a real vector store, or making a real HTTP request.
@@ -48,7 +48,10 @@ def test_ingest_all_chunks_embeds_and_stores_every_document(tmp_path, monkeypatc
 
     monkeypatch.setattr(ingest, "_load_all_documents", lambda raw_dir: fake_documents)
     monkeypatch.setattr(ingest, "_load_all_websites", lambda urls_file: [])
-    monkeypatch.setattr(ingest, "chunk_document", lambda doc, chunk_size, chunk_overlap: ["chunk1", "chunk2"])
+    # chunk_with_parent_child is a drop-in replacement for chunk_document
+    # that also emits child sentence windows for github/web KBs; ingest.py
+    # now calls it in place of chunk_document, so tests mock it directly.
+    monkeypatch.setattr(ingest, "chunk_with_parent_child", lambda doc, chunk_size, chunk_overlap: ["chunk1", "chunk2"])
     monkeypatch.setattr(ingest, "embed_chunks", lambda chunks: calls.append(("embed_chunks", chunks)) or ["embedded1", "embedded2"])
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda embedded: calls.append(("add_embedded_chunks", embedded)))
     monkeypatch.setattr(ingest, "count", lambda: 2)
@@ -92,7 +95,7 @@ def test_ingest_github_repo_chunks_embeds_and_stores_every_file(monkeypatch):
         "load_github_repository",
         lambda repo_url, branch, max_files: calls.append(("load", repo_url, branch, max_files)) or fake_documents,
     )
-    monkeypatch.setattr(ingest, "chunk_document", lambda doc, chunk_size, chunk_overlap: ["chunk"])
+    monkeypatch.setattr(ingest, "chunk_with_parent_child", lambda doc, chunk_size, chunk_overlap: ["chunk"])
     monkeypatch.setattr(
         ingest,
         "embed_chunks",
@@ -176,14 +179,14 @@ def test_ingest_all_includes_websites_alongside_files(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ingest, "_load_all_documents", lambda raw_dir: fake_file_documents)
     monkeypatch.setattr(ingest, "_load_all_websites", lambda urls_file: fake_web_documents)
-    monkeypatch.setattr(ingest, "chunk_document", lambda doc, chunk_size, chunk_overlap: ["chunk1"])
+    monkeypatch.setattr(ingest, "chunk_with_parent_child", lambda doc, chunk_size, chunk_overlap: ["chunk1"])
     monkeypatch.setattr(ingest, "embed_chunks", lambda chunks: calls.append(("embed_chunks", chunks)) or ["embedded1"])
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda embedded: calls.append(("add_embedded_chunks", embedded)))
     monkeypatch.setattr(ingest, "count", lambda: 2)
 
     total = ingest.ingest_all(raw_dir=str(tmp_path), urls_file=str(tmp_path / "urls.txt"))
 
-    # One document from files + one from websites = 2 chunk_document calls.
+    # One document from files + one from websites = 2 chunk_with_parent_child calls.
     assert total == 2
     assert calls.count(("embed_chunks", ["chunk1"])) == 2
 

@@ -33,7 +33,9 @@ Design:
 """
 
 import base64
+import json
 import logging
+from collections.abc import Iterator
 
 import requests
 from PIL import Image
@@ -42,7 +44,14 @@ logger = logging.getLogger(__name__)
 
 _OLLAMA_URL = "http://localhost:11434/api/generate"
 _OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-_DEFAULT_MODEL = "llama3.2:3b"
+# qwen2.5:7b-instruct follows retrieved context faithfully on RAG tasks
+# (technical docs, exact-code reproduction). The previous default,
+# llama3.2:3b, was too small: it routinely ignored the provided context
+# and hallucinated plausible-looking but incorrect JSON/code and made
+# up source citations, even when the correct answer was verbatim in
+# the top retrieved chunk. Both models are similar VRAM/disk footprint
+# (~4.7 GB), so this is a pure quality upgrade with no infra change.
+_DEFAULT_MODEL = "qwen2.5:7b-instruct"
 _DEFAULT_VISION_MODEL = "llava"
 
 
@@ -71,13 +80,54 @@ def generate_answer(
             `ollama run <model>` command once to start it).
     """
     logger.info("Generating answer with model='%s', temperature=%.2f", model, temperature)
+    chunks = list(generate_answer_stream(prompt, model=model, temperature=temperature))
+    answer = "".join(chunks).strip()
+    logger.info("Received answer (%d characters)", len(answer))
+    return answer
+
+
+def generate_answer_stream(
+    prompt: str,
+    model: str = _DEFAULT_MODEL,
+    temperature: float = 0.0,
+) -> Iterator[str]:
+    """
+    Same as generate_answer() but yields tokens (strings) one at a
+    time as Ollama produces them, instead of returning the full answer
+    at the end. Callers that want the finished string can just do
+    "".join(generate_answer_stream(...)) - which is exactly what
+    generate_answer does above.
+
+    Enables live token-by-token rendering in the UI (see app_ui.py's
+    use of st.write_stream), so the user sees the answer taking shape
+    on CPU-only hardware instead of staring at a spinner for 2-3 min
+    while a 7B model reproduces a long JSON/code block verbatim.
+    """
+    logger.info(
+        "Streaming answer with model='%s', temperature=%.2f, prompt_chars=%d",
+        model,
+        temperature,
+        len(prompt),
+    )
     try:
         response = requests.post(
             _OLLAMA_URL,
             json={
                 "model": model,
                 "prompt": prompt,
-                "stream": False,
+                # Streaming: Ollama emits one NDJSON line per generated
+                # token instead of a single JSON at the end. With
+                # stream=False the full generation had to finish inside
+                # ONE HTTP read timeout window - on CPU-only setups the
+                # 7B model reproducing a long JSON block verbatim
+                # regularly exceeded the previous 600s ceiling and the
+                # client raised ReadTimeout even though Ollama was
+                # still generating. Streaming makes the read timeout
+                # apply PER token instead of to the whole generation,
+                # so as long as tokens keep flowing (a few per second
+                # is easy on CPU) the request never times out no matter
+                # how long the total answer takes.
+                "stream": True,
                 # num_ctx set explicitly (Ollama's own default is only
                 # 2048) so a full build_prompt() context block - now up
                 # to ~3000 tokens on its own, see prompt_builder's
@@ -85,15 +135,18 @@ def generate_answer(
                 # model before it even sees the question.
                 "options": {"temperature": temperature, "num_ctx": 4096},
             },
-            # Larger context (num_ctx=4096, up from Ollama's default
-            # 2048) and instructions that now ask the model to
-            # reproduce whole code blocks (including every sibling
-            # element of a multi-part JSON array, not just one part)
-            # verbatim both push prompt processing + generation time up
-            # further on CPU-only setups - 300s still timed out on one
-            # of these longer, fuller-code answers, so this was raised
-            # again with more headroom.
-            timeout=600,
+            # requests-side streaming so response.iter_lines() yields
+            # NDJSON lines as Ollama emits them, without buffering the
+            # whole response in memory first.
+            stream=True,
+            # Per-chunk read timeout: max seconds we're willing to wait
+            # between two consecutive tokens (and for the very first
+            # token, which also has to cover Ollama's prompt-processing
+            # pass - the slowest step on CPU). 300s is generous headroom
+            # for a cold-start 7B model chewing through a ~3000-token
+            # prompt; steady-state token intervals on CPU are typically
+            # well under a second.
+            timeout=300,
         )
         response.raise_for_status()
     except requests.exceptions.ConnectionError:
@@ -103,9 +156,38 @@ def generate_answer(
         logger.exception("Ollama request failed")
         raise
 
-    answer = response.json()["response"].strip()
-    logger.info("Received answer (%d characters)", len(answer))
-    return answer
+    # Consume the NDJSON stream: one line per token, plus a final line
+    # with "done": true (and no more "response" content). Malformed
+    # lines are skipped defensively rather than aborting the whole
+    # generation, but note we don't expect any in practice.
+    token_count = 0
+    first_token_logged = False
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            logger.warning("Skipping malformed Ollama stream line: %r", raw_line[:200])
+            continue
+        # Ollama may return an "error" field instead of "response" if
+        # the model isn't loaded, was killed, ran out of memory, etc.
+        # Surface it so the caller/UI can see WHY the stream was empty
+        # rather than just getting silence.
+        error = event.get("error")
+        if error:
+            logger.error("Ollama returned error mid-stream: %s", error)
+            raise RuntimeError(f"Ollama error: {error}")
+        token = event.get("response")
+        if token:
+            if not first_token_logged:
+                logger.info("Ollama produced first token; streaming continues.")
+                first_token_logged = True
+            token_count += 1
+            yield token
+        if event.get("done"):
+            break
+    logger.info("Stream finished (%d tokens yielded).", token_count)
 
 
 def _download_image_bytes(image_url: str, timeout: int = 10) -> bytes | None:

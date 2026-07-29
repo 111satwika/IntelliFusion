@@ -299,18 +299,30 @@ class RouteDecision:
             actually has data). Defaults to an empty list so existing
             positional-arg call sites (RouteDecision(routes, method,
             scores)) that predate KB routing keep working unchanged.
+        kb_scores: each KB's semantic similarity score (0.0-1.0), for
+            observability/debugging - the UI uses this to show "which
+            KB is this query about, and how confidently". Defaults to
+            an empty dict for the same backward-compat reason as `kbs`.
     """
 
-    def __init__(self, routes: list[str], method: str, scores: dict[str, float], kbs: list[str] | None = None):
+    def __init__(
+        self,
+        routes: list[str],
+        method: str,
+        scores: dict[str, float],
+        kbs: list[str] | None = None,
+        kb_scores: dict[str, float] | None = None,
+    ):
         self.routes = routes
         self.method = method
         self.scores = scores
         self.kbs = kbs if kbs is not None else []
+        self.kb_scores = kb_scores if kb_scores is not None else {}
 
     def __repr__(self) -> str:
         return (
             f"RouteDecision(routes={self.routes!r}, method={self.method!r}, "
-            f"scores={self.scores!r}, kbs={self.kbs!r})"
+            f"scores={self.scores!r}, kbs={self.kbs!r}, kb_scores={self.kb_scores!r})"
         )
 
     def __eq__(self, other) -> bool:
@@ -321,6 +333,7 @@ class RouteDecision:
             and self.method == other.method
             and self.scores == other.scores
             and self.kbs == other.kbs
+            and self.kb_scores == other.kb_scores
         )
 
 
@@ -351,7 +364,9 @@ def classify_route(query_text: str) -> RouteDecision:
     kbs = sorted(rule_kbs | semantic_kbs)
 
     if not matched_routes:
-        decision = RouteDecision(routes=["general"], method="default", scores=semantic_scores, kbs=kbs)
+        decision = RouteDecision(
+            routes=["general"], method="default", scores=semantic_scores, kbs=kbs, kb_scores=kb_scores,
+        )
     else:
         routes = sorted(matched_routes | {"general"})
         if rule_routes and semantic_routes:
@@ -360,10 +375,12 @@ def classify_route(query_text: str) -> RouteDecision:
             method = "rule"
         else:
             method = "semantic"
-        decision = RouteDecision(routes=routes, method=method, scores=semantic_scores, kbs=kbs)
+        decision = RouteDecision(
+            routes=routes, method=method, scores=semantic_scores, kbs=kbs, kb_scores=kb_scores,
+        )
 
     logger.info(
-        "Routed query %r to %s (method=%s, scores=%s, kbs=%s)",
-        query_text, decision.routes, decision.method, decision.scores, decision.kbs,
+        "Routed query %r to routes=%s kbs=%s (method=%s, route_scores=%s, kb_scores=%s)",
+        query_text, decision.routes, decision.kbs, decision.method, decision.scores, decision.kb_scores,
     )
     return decision

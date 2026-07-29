@@ -14,3 +14,4 @@ venv/
 data/chroma_db/
 data/raw/
 data/*.log
+data/pending_documents.json

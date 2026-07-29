@@ -21,8 +21,14 @@ API) without depending on this CLI.
 
 import argparse
 import logging
+import re
+from collections.abc import Iterator
 
-from app.generation.llm_generator import generate_answer, generate_answer_with_images
+from app.generation.llm_generator import (
+    generate_answer,
+    generate_answer_stream,
+    generate_answer_with_images,
+)
 from app.logging_config import configure_logging
 from app.prompting.prompt_builder import build_prompt
 from app.retrieval.retriever import retrieve, retrieve_images
@@ -38,6 +44,53 @@ logger = logging.getLogger(__name__)
 # clearly-unrelated images rather than to mean "highly confident match".
 IMAGE_SIMILARITY_THRESHOLD = 0.2
 MAX_IMAGES_FOR_VISION = 2
+
+# Matches the "[Image: alt] (url)" markers that _build_website_document
+# inlines into each web-KB chunk right where the <img> sits in the HTML
+# (see app.ingestion.loader._describe_image_tag). If a retrieved text
+# chunk contains one of these, the doc page's author has already told
+# us that image belongs next to that prose - a much stronger relevance
+# signal than CLIP cosine similarity between the query and the image's
+# pixels, especially for corpora (like IBM docs) where every setup
+# screenshot looks visually similar to every other setup screenshot.
+_IMAGE_MARKER_RE = re.compile(r"\[Image:\s*([^\]]*)\]\s*\(([^)\s]+)\)")
+
+
+def _images_referenced_in_chunks(chunks: list[dict]) -> list[dict]:
+    """
+    Extract images explicitly named in the retrieved chunks (via the
+    "[Image: alt] (url)" markers, see _IMAGE_MARKER_RE) and return
+    them shaped like retrieve_images() hits so they can be displayed
+    alongside CLIP-retrieved ones.
+
+    The chunk's OWN text is telling us these images belong next to it,
+    so similarity is set to 1.0 - by definition they pass any
+    IMAGE_SIMILARITY_THRESHOLD without needing a separate CLIP-based
+    relevance check.
+    """
+    seen_urls: set[str] = set()
+    hits: list[dict] = []
+    for chunk in chunks:
+        content = chunk.get("content") or ""
+        chunk_metadata = chunk.get("metadata") or {}
+        page_url = chunk_metadata.get("url")
+        for match in _IMAGE_MARKER_RE.finditer(content):
+            alt_text = match.group(1).strip() or None
+            image_url = match.group(2).strip()
+            if not image_url or image_url in seen_urls:
+                continue
+            seen_urls.add(image_url)
+            hits.append(
+                {
+                    "metadata": {
+                        "image_url": image_url,
+                        "alt_text": alt_text,
+                        "page_url": page_url,
+                    },
+                    "similarity": 1.0,
+                }
+            )
+    return hits
 
 
 def ask(query_text: str, top_k: int = 3, repository: str | None = None) -> str:
@@ -64,7 +117,11 @@ def _is_code_screenshot(image_url: str) -> bool:
 
 
 def ask_with_vision(
-    query_text: str, top_k: int = 3, use_vision: bool = False, repository: str | None = None
+    query_text: str,
+    top_k: int = 3,
+    use_vision: bool = False,
+    repository: str | None = None,
+    kb: str | None = None,
 ) -> tuple[str, list[dict]]:
     """
     Same pipeline as ask(), but additionally retrieves relevant images
@@ -112,7 +169,108 @@ def ask_with_vision(
         them (e.g. app_ui.py), regardless of whether they were also
         sent to the vision model.
     """
-    chunks = retrieve(query_text, top_k=top_k, repository=repository)
+    prompt, display_images, vision_image_urls = _prepare_context_and_images(
+        query_text, top_k=top_k, use_vision=use_vision, repository=repository, kb=kb
+    )
+    if vision_image_urls:
+        try:
+            answer = generate_answer_with_images(prompt, vision_image_urls)
+        except Exception:
+            # Vision models are slow on CPU and can time out; the text
+            # context already includes any OCR'd text from these same
+            # images (see app.ocr.image_ocr), so falling back to the
+            # text-only pipeline still gives a useful answer instead
+            # of a hard failure.
+            logger.exception("Vision generation failed; falling back to text-only answer.")
+            answer = generate_answer(prompt)
+    else:
+        answer = generate_answer(prompt)
+    return answer, display_images
+
+
+def ask_with_vision_stream(
+    query_text: str,
+    top_k: int = 3,
+    use_vision: bool = False,
+    repository: str | None = None,
+    kb: str | None = None,
+) -> tuple[Iterator[str], list[dict]]:
+    """
+    Streaming counterpart to ask_with_vision(): identical retrieval,
+    prompt-assembly, and image-hit logic, but returns a token iterator
+    for the answer instead of the finished string, so callers (e.g.
+    app_ui.py's st.write_stream) can render tokens live as Ollama
+    produces them. Especially useful on CPU-only setups where a full
+    7B-model answer takes 2-3 minutes - the user sees the answer
+    taking shape instead of staring at a spinner.
+
+    Semantic differences vs ask_with_vision():
+      * When the vision model would fire (auto-detected code
+        screenshots, or use_vision=True), we FALL BACK to the
+        non-streaming vision path and yield the finished answer as a
+        single chunk. Streaming a multi-image vision request requires
+        piecing tokens together from a different Ollama endpoint
+        response shape, and vision runs are the outlier - the vast
+        majority of RAG queries are text-only and benefit fully from
+        live streaming.
+      * On vision failure we fall back to text-only STREAMING (not the
+        non-streaming path), so the timeout-free behavior is preserved
+        even in the fallback case.
+
+    Returns:
+        (token_iterator, image_hits_for_display) - image_hits_for_display
+        matches ask_with_vision's second return value exactly.
+    """
+    prompt, display_images, vision_image_urls = _prepare_context_and_images(
+        query_text, top_k=top_k, use_vision=use_vision, repository=repository, kb=kb
+    )
+    if vision_image_urls:
+        # Non-streaming vision path with a text-only STREAMING fallback
+        # if vision fails/times out. Wrapped in an inner generator so
+        # ask_with_vision_stream can uniformly return an Iterator[str]
+        # to its caller regardless of which path actually runs.
+        def _vision_then_maybe_stream() -> Iterator[str]:
+            try:
+                yield generate_answer_with_images(prompt, vision_image_urls)
+            except Exception:
+                logger.exception("Vision generation failed; falling back to streaming text-only answer.")
+                yield from generate_answer_stream(prompt)
+
+        return _vision_then_maybe_stream(), display_images
+
+    return generate_answer_stream(prompt), display_images
+
+
+def _prepare_context_and_images(
+    query_text: str,
+    top_k: int,
+    use_vision: bool,
+    repository: str | None,
+    kb: str | None,
+) -> tuple[str, list[dict], list[str]]:
+    """
+    Shared retrieval + prompt-assembly + image-hit computation for
+    ask_with_vision() and ask_with_vision_stream(), extracted so the
+    two entry points can't drift in what gets retrieved, what shows
+    up in the UI, or what gets sent to the vision model.
+
+    Returns:
+        prompt              - finished prompt string ready for the LLM.
+        display_images      - image hits to render below the answer in
+                              the UI (CLIP-retrieved that cleared
+                              IMAGE_SIMILARITY_THRESHOLD, PLUS every
+                              image explicitly named by an [Image: ...]
+                              (url) marker in the retrieved chunks -
+                              see _images_referenced_in_chunks).
+        vision_image_urls   - image_urls to actually send to the
+                              vision model (subset of display_images:
+                              code screenshots when use_vision=False,
+                              all CLIP hits when use_vision=True, and
+                              always empty when CLIP retrieved nothing;
+                              chunk-referenced images are never sent
+                              to vision, only displayed).
+    """
+    chunks = retrieve(query_text, top_k=top_k, repository=repository, kb=kb)
     prompt = build_prompt(query_text, chunks)
 
     # Query routing (see app.routing.router): the image retriever uses
@@ -135,24 +293,30 @@ def ask_with_vision(
     if use_vision:
         images_to_send = relevant_images
     else:
-        images_to_send = [hit for hit in relevant_images if _is_code_screenshot(hit["metadata"]["image_url"])]
+        images_to_send = [
+            hit for hit in relevant_images if _is_code_screenshot(hit["metadata"]["image_url"])
+        ]
+    vision_image_urls = [hit["metadata"]["image_url"] for hit in images_to_send]
 
-    if images_to_send:
-        image_urls = [hit["metadata"]["image_url"] for hit in images_to_send]
-        try:
-            answer = generate_answer_with_images(prompt, image_urls)
-        except Exception:
-            # Vision models are slow on CPU and can time out; the text
-            # context already includes any OCR'd text from these same
-            # images (see app.ocr.image_ocr), so falling back to the
-            # text-only pipeline still gives a useful answer instead
-            # of a hard failure.
-            logger.exception("Vision generation failed; falling back to text-only answer.")
-            answer = generate_answer(prompt)
-    else:
-        answer = generate_answer(prompt)
+    # Additionally SURFACE (for UI display only, not for the vision
+    # model) every image that a retrieved chunk explicitly names via
+    # its "[Image: alt] (url)" marker - the chunk's own text tells us
+    # these images belong next to the answer being generated, whether
+    # or not CLIP's separate embedding space happens to rank them
+    # highly for this query. This is what makes the "setup screenshot"
+    # for e.g. a Targetprocess automation rule appear alongside the
+    # rule's JSON code, even when the query ("give me the code for X")
+    # contains no visual keywords for the router (see
+    # app.routing.router._IMAGE_KEYWORDS) and image retrieval is
+    # therefore skipped entirely. Merged after the vision decision so
+    # the (small) LLM-call cost stays bounded by CLIP + MAX_IMAGES_FOR_VISION.
+    seen_urls = {hit["metadata"].get("image_url") for hit in relevant_images}
+    for referenced_hit in _images_referenced_in_chunks(chunks):
+        if referenced_hit["metadata"]["image_url"] not in seen_urls:
+            relevant_images.append(referenced_hit)
+            seen_urls.add(referenced_hit["metadata"]["image_url"])
 
-    return answer, relevant_images
+    return prompt, relevant_images, vision_image_urls
 
 
 def main() -> None:

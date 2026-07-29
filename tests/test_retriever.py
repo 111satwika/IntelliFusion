@@ -31,11 +31,19 @@ def _default_general_route(monkeypatch):
     on disk - this keeps the "one unfiltered query_embedding call per
     matched route" assumption most pre-existing tests rely on true
     regardless of the multi-KB split.
+
+    "_dense_only_test_kb" is a deliberately fake name that isn't in
+    any real KB set: every real KB (pdf, docx, markdown, github, web)
+    now goes through hybrid_retriever, which BYPASSES retriever.py's
+    query_embedding() call that these tests mock directly. Using a
+    non-hybrid name keeps the dispatch on the plain per-route dense
+    loop so mocking query_embedding still fully controls what these
+    tests see.
     """
     monkeypatch.setattr(
         retriever, "classify_route", lambda query_text: RouteDecision(["general"], "default", {})
     )
-    monkeypatch.setattr(retriever, "list_populated_kbs", lambda: ["markdown"])
+    monkeypatch.setattr(retriever, "list_populated_kbs", lambda: ["_dense_only_test_kb"])
 
 
 def test_retrieve_embeds_query_and_forwards_to_vector_store(monkeypatch):
@@ -95,13 +103,23 @@ def test_retrieve_scopes_to_a_repository_when_given(monkeypatch):
 
 
 def test_retrieve_runs_one_query_per_matched_route_with_content_type_filters(monkeypatch):
-    # A query routed to both "code" and "general" should run TWO
-    # separate query_embedding calls - one scoped to code content
-    # types, one unscoped - rather than a single call, since these are
-    # genuinely separate retrievers being combined (see
-    # app.routing.router's "multi-retriever routing"). The "code"
-    # content_type filter only ever matches in the "github" KB, so the
-    # decision must target that KB for both queries to actually run.
+    # A query routed to both "code" and "general" against a KB that
+    # still uses the per-route dense loop should run TWO separate
+    # query_embedding calls - one scoped to code content types, one
+    # unscoped - rather than a single call, since these are genuinely
+    # separate retrievers being combined (see app.routing.router's
+    # "multi-retriever routing").
+    #
+    # The "code" content_type filter only ever matches in the "github"
+    # KB in production. But github now goes through hybrid_retriever
+    # (which subsumes route-based dispatch into its dense + BM25 +
+    # cross-encoder + parent-child ensemble), so this test uses a
+    # synthetic "_dense_only_test_kb" that isn't in _HYBRID_KBS to
+    # keep exercising the per-route dense loop that this test is
+    # actually about. The code content_type restriction in
+    # _ROUTE_CONTENT_TYPE_KB_RESTRICTION is loosened for the same
+    # reason - the test doesn't care which KB code-typed chunks live
+    # in, only that a code-routed query issues a filtered call.
     calls = []
 
     def fake_query_embedding(vector, top_k, where=None, kb=None):
@@ -113,8 +131,12 @@ def test_retrieve_runs_one_query_per_matched_route_with_content_type_filters(mon
     monkeypatch.setattr(
         retriever,
         "classify_route",
-        lambda query_text: RouteDecision(["code", "general"], "rule", {}, kbs=["github"]),
+        lambda query_text: RouteDecision(["code", "general"], "rule", {}, kbs=["_dense_only_test_kb"]),
     )
+    # The production restriction says "code" content_type only exists
+    # in the github KB. Bypass it for this test so the code route
+    # actually issues a query for the synthetic KB.
+    monkeypatch.setattr(retriever, "_ROUTE_CONTENT_TYPE_KB_RESTRICTION", {})
 
     retriever.retrieve("show me the function that validates input")
 

@@ -11,7 +11,7 @@ Design:
 - _LOADERS_BY_EXTENSION maps a file extension to the loader function
   that knows how to read it. Adding a new source type means adding one
   entry here, pointing at a loader that returns a Document or
-  list[Document] - chunk_document(), embed_chunks(), and
+  list[Document] - chunk_with_parent_child(), embed_chunks(), and
   add_embedded_chunks() are already source-agnostic (they only look at
   Document.content/metadata), so nothing else needs to change.
 - A loader may return a single Document (e.g. one Markdown file, one
@@ -72,7 +72,7 @@ from pathlib import Path
 
 import requests
 
-from app.chunking.chunker import chunk_document
+from app.chunking.parent_child import chunk_with_parent_child
 from app.embeddings.embedder import EmbeddedChunk, embed_chunks, embed_texts
 from app.embeddings.image_embedder import download_image, embed_images
 from app.generation.llm_generator import generate_vision_text
@@ -89,7 +89,13 @@ from app.ingestion.loader import (
 from app.ocr.image_classifier import CODE, classify_extracted_text
 from app.ocr.image_ocr import combine_ocr_and_vision, extract_text_from_image
 from app.ocr.prompts import CODE_EXTRACTION_PROMPT
-from app.vectorstore.store import add_embedded_chunks, add_image_chunks, count, image_count
+from app.vectorstore.store import (
+    _iter_collections,
+    add_embedded_chunks,
+    add_image_chunks,
+    count,
+    image_count,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +196,34 @@ def _load_all_websites(urls_file: str) -> list[Document]:
     return documents
 
 
+def _already_extracted_image_urls() -> set[str]:
+    """
+    Return the set of image_urls that already have a text chunk stored
+    (content_type in {"image_code", "image_ocr"}) across every text
+    KB. Used by _ingest_images() to skip re-downloading, re-OCR'ing,
+    and (crucially) re-running the slow llava vision pass on images
+    whose text is already extracted from a prior ingest run.
+
+    Called once per _ingest_images() invocation (i.e. once per
+    document). Cost is one metadata-only get() per text KB with no
+    similarity search - fast (milliseconds) even with thousands of
+    chunks, and orders of magnitude cheaper than a single wasted llava
+    call.
+    """
+    urls: set[str] = set()
+    for collection in _iter_collections():
+        for content_type in ("image_code", "image_ocr"):
+            result = collection.get(
+                where={"content_type": content_type},
+                include=["metadatas"],
+            )
+            for metadata in result["metadatas"]:
+                url = metadata.get("image_url")
+                if url:
+                    urls.add(url)
+    return urls
+
+
 def _ingest_images(document: Document) -> int:
     """
     Extract, download (once), embed (via CLIP), and extract text from
@@ -256,6 +290,29 @@ def _ingest_images(document: Document) -> int:
         return 0
 
     records_by_url = {record["image_url"]: record for record in records}
+
+    # Skip images that already have a text chunk (image_code/image_ocr)
+    # from a prior ingest run. This makes a re-crawl idempotent AND
+    # cheap: without this check every re-ingest would re-download every
+    # image, re-OCR it, re-classify it, and (worst) re-run llava on
+    # every code screenshot from scratch - the same multi-hour vision
+    # pass whose result is already in the store. New/decorative images
+    # (no text chunk yet) still run the full pipeline.
+    already_done = _already_extracted_image_urls()
+    skipped_count = 0
+    if already_done:
+        pending_records = {
+            url: record for url, record in records_by_url.items() if url not in already_done
+        }
+        skipped_count = len(records_by_url) - len(pending_records)
+        records_by_url = pending_records
+    if not records_by_url:
+        if skipped_count:
+            logger.info(
+                "All %d image(s) on this page were already extracted in a prior run - skipping",
+                skipped_count,
+            )
+        return 0
 
     images_by_url = {}
     for image_url in records_by_url:
@@ -324,11 +381,18 @@ def _ingest_images(document: Document) -> int:
             chunk.embedding = vector
         add_embedded_chunks(extracted_chunks)
         logger.info(
-            "Extracted text from %d/%d image(s) (%d classified as code, vision-cross-checked) "
-            "and stored as additional text chunk(s)",
+            "Extracted text from %d/%d image(s) (%d classified as code, vision-cross-checked; "
+            "%d skipped as already-extracted from prior run) and stored as additional text chunk(s)",
             len(extracted_chunks),
             len(valid_urls),
             code_image_count,
+            skipped_count,
+        )
+    elif skipped_count:
+        logger.info(
+            "Skipped %d image(s) on this page as already-extracted from a prior run "
+            "(no new text chunks to add)",
+            skipped_count,
         )
 
     return len(image_chunks)
@@ -355,8 +419,8 @@ def ingest_all(
         raw_dir: Directory to scan for source files.
         urls_file: Path to a text file listing one URL per line (blank
             lines and "#" comments ignored). Missing file = no URLs.
-        chunk_size: Passed through to chunk_document for every source.
-        chunk_overlap: Passed through to chunk_document for every source.
+        chunk_size: Passed through to chunk_with_parent_child for every source.
+        chunk_overlap: Passed through to chunk_with_parent_child for every source.
 
     Returns:
         The total number of text chunks stored across all sources
@@ -374,7 +438,7 @@ def ingest_all(
     total_chunks = 0
     total_images = 0
     for document in documents:
-        chunks = chunk_document(document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        chunks = chunk_with_parent_child(document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         embedded_chunks = embed_chunks(chunks)
         add_embedded_chunks(embedded_chunks)
         total_chunks += len(chunks)
@@ -428,8 +492,8 @@ def ingest_github_repo(
             forms, e.g. "https://github.com/owner/repo" or
             "owner/repo").
         branch: Branch to ingest. None = the repo's default branch.
-        chunk_size: Passed through to chunk_document.
-        chunk_overlap: Passed through to chunk_document.
+        chunk_size: Passed through to chunk_with_parent_child.
+        chunk_overlap: Passed through to chunk_with_parent_child.
         max_files: Cap on how many files to ingest from the repo.
 
     Returns:
@@ -440,7 +504,7 @@ def ingest_github_repo(
 
     total_chunks = 0
     for document in documents:
-        chunks = chunk_document(document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        chunks = chunk_with_parent_child(document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         embedded_chunks = embed_chunks(chunks)
         add_embedded_chunks(embedded_chunks)
         total_chunks += len(chunks)

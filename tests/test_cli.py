@@ -60,7 +60,7 @@ def test_ask_wires_retrieve_build_prompt_and_generate_answer_in_order(monkeypatc
 def test_ask_default_top_k_is_three(monkeypatch):
     captured = {}
 
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: captured.setdefault("top_k", top_k) or [])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: captured.setdefault("top_k", top_k) or [])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
     monkeypatch.setattr(cli, "generate_answer", lambda prompt: "ANSWER")
 
@@ -70,7 +70,7 @@ def test_ask_default_top_k_is_three(monkeypatch):
 
 
 def test_ask_with_vision_uses_text_only_generator_when_no_relevant_images(monkeypatch):
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: ["chunk1"])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: ["chunk1"])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
     monkeypatch.setattr(cli, "retrieve_images", lambda q, top_k: [{"similarity": 0.05, "metadata": {"image_url": "u"}}])
     monkeypatch.setattr(cli, "generate_answer", lambda prompt: "TEXT ANSWER")
@@ -92,7 +92,7 @@ def test_ask_with_vision_defaults_to_text_only_even_with_relevant_images(monkeyp
     # caller explicitly opts in.
     relevant_hit = {"similarity": 0.9, "metadata": {"image_url": "https://example.com/a.png"}}
 
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: ["chunk1"])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: ["chunk1"])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
     monkeypatch.setattr(cli, "retrieve_images", lambda q, top_k: [relevant_hit])
     monkeypatch.setattr(cli, "generate_answer", lambda prompt: "TEXT ANSWER")
@@ -118,7 +118,7 @@ def test_ask_with_vision_auto_uses_vision_for_code_screenshot_even_without_use_v
     relevant_hit = {"similarity": 0.9, "metadata": {"image_url": "https://example.com/code.png"}}
     calls = []
 
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: ["chunk1"])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: ["chunk1"])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
     monkeypatch.setattr(cli, "retrieve_images", lambda q, top_k: [relevant_hit])
     monkeypatch.setattr(cli, "generate_answer", lambda prompt: (_ for _ in ()).throw(AssertionError("should not be called")))
@@ -143,7 +143,7 @@ def test_ask_with_vision_uses_vision_generator_when_relevant_images_found(monkey
     relevant_hit = {"similarity": 0.9, "metadata": {"image_url": "https://example.com/a.png"}}
     calls = []
 
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: ["chunk1"])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: ["chunk1"])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
     monkeypatch.setattr(cli, "retrieve_images", lambda q, top_k: [relevant_hit])
     monkeypatch.setattr(cli, "generate_answer", lambda prompt: (_ for _ in ()).throw(AssertionError("should not be called")))
@@ -162,7 +162,7 @@ def test_ask_with_vision_uses_vision_generator_when_relevant_images_found(monkey
 
 
 def test_ask_with_vision_falls_back_to_text_when_image_retrieval_fails(monkeypatch):
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: ["chunk1"])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: ["chunk1"])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
 
     def fake_retrieve_images(q, top_k):
@@ -180,7 +180,7 @@ def test_ask_with_vision_falls_back_to_text_when_image_retrieval_fails(monkeypat
 def test_ask_with_vision_falls_back_to_text_when_vision_generation_fails(monkeypatch):
     relevant_hit = {"similarity": 0.9, "metadata": {"image_url": "https://example.com/a.png"}}
 
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: ["chunk1"])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: ["chunk1"])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
     monkeypatch.setattr(cli, "retrieve_images", lambda q, top_k: [relevant_hit])
     monkeypatch.setattr(cli, "generate_answer", lambda prompt: "TEXT ANSWER")
@@ -203,7 +203,7 @@ def test_ask_with_vision_skips_image_retrieval_when_query_is_not_routed_to_image
     # skipping it entirely for clearly non-visual questions avoids that
     # extra cost.
     monkeypatch.setattr(cli, "classify_route", lambda query_text: RouteDecision(["general"], "default", {}))
-    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None: ["chunk1"])
+    monkeypatch.setattr(cli, "retrieve", lambda q, top_k, repository=None, kb=None: ["chunk1"])
     monkeypatch.setattr(cli, "build_prompt", lambda q, chunks: "PROMPT")
     monkeypatch.setattr(cli, "generate_answer", lambda prompt: "TEXT ANSWER")
 

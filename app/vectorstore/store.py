@@ -77,6 +77,23 @@ logger = logging.getLogger(__name__)
 CHROMA_DB_DIR = str(Path(__file__).resolve().parent.parent.parent / "data" / "chroma_db")
 IMAGE_COLLECTION_NAME = "rag_image_chunks"
 
+
+def _invalidate_hybrid_cache(kb: str) -> None:
+    """
+    Drop any BM25/hybrid-retriever caches for the given KB whenever
+    its stored chunks change. Lazily imported to avoid a circular
+    dependency (hybrid_retriever imports from this module).
+
+    Silently no-ops if the hybrid module isn't importable (e.g. in a
+    test environment that stubs out retrieval).
+    """
+    try:
+        from app.retrieval.hybrid_retriever import invalidate_bm25_cache
+    except ImportError:
+        return
+    invalidate_bm25_cache(kb)
+
+
 # One Chroma collection per source "knowledge base" (see module
 # docstring). Order here is only for readability/logging - it has no
 # effect on routing or search results.
@@ -232,6 +249,7 @@ def add_embedded_chunks(chunks: list[EmbeddedChunk]) -> None:
             metadatas=metadatas,
         )
         logger.info("Stored/updated %d chunk(s) in KB '%s' (collection '%s')", len(ids), kb, _COLLECTION_NAME_BY_KB[kb])
+        _invalidate_hybrid_cache(kb)
 
 
 def query_embedding(query_vector: list[float], top_k: int = 5, where: dict | None = None, kb: str = _DEFAULT_KB) -> list[dict]:
@@ -471,6 +489,63 @@ def list_repositories() -> list[str]:
             metadata.get("repository") for metadata in result["metadatas"] if metadata.get("repository")
         )
     return sorted(repositories)
+
+
+def delete_document(document_id: str, kb: str | None = None) -> int:
+    """
+    Delete every chunk whose metadata `document_id` matches the given
+    value. Returns the number of chunks removed.
+
+    Args:
+        document_id: The document_id metadata value written by the
+            loader (e.g. the file path for PDF/DOCX/Markdown, the URL
+            for a website page).
+        kb: Optional - if given, only delete from that specific KB
+            (faster). If None, checks every KB (safer when the caller
+            doesn't know which KB a document lives in).
+
+    Used by the UI's "discard" and auto-cleanup-of-abandoned-session
+    paths to remove ingested-but-not-saved documents (see app_ui.py).
+    """
+    collections = [_get_collection(kb)] if kb is not None else list(_iter_collections())
+    total_deleted = 0
+    affected_kbs: set[str] = set()
+    for collection in collections:
+        existing = collection.get(where={"document_id": document_id}, include=[])
+        ids = existing["ids"]
+        if ids:
+            collection.delete(ids=ids)
+            total_deleted += len(ids)
+            # collection.name is e.g. "rag_chunks_pdf" - map back to kb.
+            for kb_name, coll_name in _COLLECTION_NAME_BY_KB.items():
+                if coll_name == collection.name:
+                    affected_kbs.add(kb_name)
+    if total_deleted:
+        logger.info("Deleted %d chunk(s) for document_id=%r", total_deleted, document_id)
+    for affected_kb in affected_kbs:
+        _invalidate_hybrid_cache(affected_kb)
+    return total_deleted
+
+
+def delete_repository(repository: str) -> int:
+    """
+    Delete every chunk whose metadata `repository` matches the given
+    "owner/repo" value (see app.ingestion.loader.load_github_repository).
+    Returns the number of chunks removed.
+
+    Only the "github" KB is checked, because that's the only KB
+    GitHub-sourced chunks are ever written to (see module docstring's
+    _SOURCE_TYPE_TO_KB); other KBs are guaranteed not to have a
+    `repository` metadata key.
+    """
+    collection = _get_collection("github")
+    existing = collection.get(where={"repository": repository}, include=[])
+    ids = existing["ids"]
+    if ids:
+        collection.delete(ids=ids)
+        logger.info("Deleted %d chunk(s) for repository=%r", len(ids), repository)
+    return len(ids)
+
 
 
 def add_image_chunks(image_chunks: list[dict]) -> None:

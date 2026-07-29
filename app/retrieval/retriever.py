@@ -42,6 +42,7 @@ import re
 
 from app.embeddings.embedder import embed_texts
 from app.embeddings.image_embedder import embed_text_for_image_search
+from app.retrieval.hybrid_retriever import _HYBRID_KBS, retrieve_hybrid
 from app.routing.router import classify_route
 from app.vectorstore.store import (
     KB_NAMES,
@@ -298,7 +299,12 @@ def _complete_partial_classes(hits: list[dict]) -> list[dict]:
     return completed
 
 
-def retrieve(query_text: str, top_k: int = 5, repository: str | None = None) -> list[dict]:
+def retrieve(
+    query_text: str,
+    top_k: int = 5,
+    repository: str | None = None,
+    kb: str | None = None,
+) -> list[dict]:
     """
     Find the top_k chunks most relevant to a user's question.
 
@@ -314,6 +320,14 @@ def retrieve(query_text: str, top_k: int = 5, repository: str | None = None) -> 
             an unrelated, previously-ingested repo's chunks instead
             (whichever happen to rank highest). None (the default)
             searches every repo in whichever KB(s) are searched.
+        kb: Optional explicit KB scope (one of
+            app.vectorstore.store.KB_NAMES). When given, retrieval is
+            forced to that single KB regardless of what
+            classify_route() would otherwise decide - used by the UI's
+            per-KB tab chats to keep a "PDF tab" chat searching only
+            PDFs, etc. None (the default) leaves the KB decision to
+            routing (decision.kbs) plus the list_populated_kbs()
+            fallback.
 
     Query routing (see app.routing.router) drives TWO independent
     decisions before any searching happens:
@@ -348,7 +362,10 @@ def retrieve(query_text: str, top_k: int = 5, repository: str | None = None) -> 
     )
     query_vector = embed_texts([query_text])[0]
     decision = classify_route(query_text)
-    target_kbs = decision.kbs or list_populated_kbs()
+    if kb is not None:
+        target_kbs = [kb]
+    else:
+        target_kbs = decision.kbs or list_populated_kbs()
     # Fetch a wider candidate pool than top_k so _rerank_by_title_overlap
     # has enough rank-adjacent candidates to promote a correct chunk
     # that plain embedding similarity ranked just outside top_k, rather
@@ -362,6 +379,28 @@ def retrieve(query_text: str, top_k: int = 5, repository: str | None = None) -> 
     seen_chunks: set[tuple] = set()
     candidates: list[dict] = []
     for kb in target_kbs:
+        # PDF, DOCX, and Markdown all use the same hybrid strategy:
+        # dense + BM25 fused by Reciprocal Rank Fusion, then re-scored
+        # by a cross-encoder (see app.retrieval.hybrid_retriever). It
+        # replaces the whole per-route dense fan-out for these KBs -
+        # the hybrid pipeline already fuses lexical + semantic signals
+        # in a way that subsumes what the route-based content_type
+        # filter would add here. Other KBs (github, web) still use the
+        # per-route dense loop below.
+        if kb in _HYBRID_KBS:
+            where = _build_where(repository, None)
+            for hit in retrieve_hybrid(
+                query_text, query_vector, kb=kb, top_k=top_k, where=where
+            ):
+                document_id = hit["metadata"].get("document_id")
+                if document_id is not None:
+                    dedup_key = (document_id, hit["metadata"].get("chunk_index"))
+                    if dedup_key in seen_chunks:
+                        continue
+                    seen_chunks.add(dedup_key)
+                candidates.append(hit)
+            continue
+
         for route in decision.routes:
             content_types = _ROUTE_CONTENT_TYPES.get(route)
             if route != "general" and content_types is None:
