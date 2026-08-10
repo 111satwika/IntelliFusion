@@ -143,6 +143,11 @@ def _process_one_image(record: dict, skip_vision: bool) -> bool:
         "content_type": content_type,
         "image_url": image_url,
         "source_type": record.get("source_type", "web"),
+        # See the matching field in app.ingestion.ingest._ingest_images:
+        # without this, hybrid_retriever's chunk_role="parent" filter
+        # (dense search + BM25 index, for "web"/"github" KBs) silently
+        # excludes this chunk from retrieval entirely.
+        "chunk_role": "parent",
     }
 
     [vector] = embed_texts([content])

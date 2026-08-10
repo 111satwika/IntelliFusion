@@ -59,23 +59,44 @@ app.vectorstore.store splits text chunks across separate
 source-specific KB collections (KB_NAMES: "markdown", "pdf", "docx",
 "web", "github") instead of one shared collection, specifically so a
 query can search only the KB(s) it's actually about. classify_route()
-applies the SAME two mechanisms (rule-based keywords + semantic
-exemplar similarity) to decide `.kbs` - which KB(s) a query explicitly
-signals (e.g. "in the PDF", "on the website", "in the codebase").
-Unlike `.routes`, `.kbs` has NO always-included default here: an empty
-list means "no explicit KB signal" and it's left to the caller
+applies the same two-mechanism idea (rule-based keywords + semantic
+similarity) to decide `.kbs` - which KB(s) a query explicitly signals
+(e.g. "in the PDF", "on the website", "in the codebase"). Unlike
+`.routes`, `.kbs` has NO always-included default here: an empty list
+means "no explicit KB signal" and it's left to the caller
 (app.retrieval.retriever) to decide the fallback - searching every KB
 that actually has data (app.vectorstore.store.list_populated_kbs()) -
-since only the caller knows which KBs are populated. This keeps this
-module's classification pure (no store/disk access) and keeps the same
-safety-net philosophy: an empty/wrong `.kbs` guess never loses recall,
-it only fails to narrow the search.
+since only the caller knows which KBs are populated. An empty/wrong
+`.kbs` guess never loses recall, it only fails to narrow the search.
+
+KB semantic scoring is CORPUS-DERIVED, not hand-written exemplars (a
+deliberate difference from the content-type routes above, which stay
+hand-written - see _ROUTE_EXEMPLARS): each KB's score is the query's
+best cosine similarity against a random SAMPLE of that KB's own
+already-stored chunk embeddings (app.vectorstore.store.
+sample_kb_embeddings), not against a fixed set of example questions
+someone had to guess in advance. Hand-written exemplars like "what
+does the website say about this" only work when a user's real
+questions happen to resemble that generic meta-phrasing - for a KB
+whose actual content is, say, Targetprocess automation-rule docs, a
+real question ("close a User Story when all its Tasks are closed")
+reads nothing like that exemplar even though it's exactly the kind of
+content that KB holds, so it scored near zero and the router silently
+fell back to searching every KB. Sampling the KB's own real content
+sidesteps needing anyone to anticipate every deployment's domain
+vocabulary - the corpus IS the exemplar set. This does mean this
+module now touches the vector store (previously documented as
+deliberately "pure"); the sample is small (default 40 chunks) and
+cached per KB, invalidated by app.vectorstore.store whenever that KB's
+chunks change (see invalidate_kb_routing_cache below), so the cost is
+one-time per KB per ingest/delete, not per query.
 """
 
 import logging
 import math
 
 from app.embeddings.embedder import embed_texts
+from app.vectorstore.store import KB_NAMES, sample_kb_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +119,22 @@ _IMAGE_KEYWORDS = [
     "image", "screenshot", "picture", "diagram", "figure", "photo",
     "graphic", "chart", "visual",
 ]
+# Deliberately distinct from KB-routing's own _AUDIO_KB_KEYWORDS
+# ("podcast", "recording", ...) - that dimension picks WHICH KB to
+# search; this one picks WHICH RETRIEVER KIND (native acoustic
+# similarity via CLAP, see app.retrieval.retriever.retrieve_audio_clips,
+# vs. the ordinary text/transcript path). A query can fire both
+# dimensions at once with no conflict.
+_SOUND_KEYWORDS = [
+    "sounds like", "similar sound", "sound similar", "similar-sounding",
+    "audio clip", "background noise", "sound effect",
+]
 
 _KEYWORDS_BY_ROUTE = {
     "code": _CODE_KEYWORDS,
     "table": _TABLE_KEYWORDS,
     "image": _IMAGE_KEYWORDS,
+    "sound": _SOUND_KEYWORDS,
 }
 
 
@@ -145,6 +177,12 @@ _ROUTE_EXEMPLARS: dict[str, list[str]] = {
         "what does this diagram look like",
         "is there a picture of the dashboard",
         "display the architecture diagram",
+    ],
+    "sound": [
+        "find audio that sounds like a car engine",
+        "is there a recording with laughter in it",
+        "play me something that sounds like rain",
+        "find a clip with similar background music",
     ],
 }
 
@@ -205,6 +243,8 @@ _PDF_KB_KEYWORDS = ["pdf", ".pdf"]
 _DOCX_KB_KEYWORDS = ["docx", "word doc", "word document", ".docx"]
 _WEB_KB_KEYWORDS = ["website", "web page", "webpage", "docs site", "documentation site", "online docs", "the url"]
 _GITHUB_KB_KEYWORDS = ["github", "repository", "repo ", " repo", "codebase", "source code", "the code"]
+_AUDIO_KB_KEYWORDS = ["audio", "podcast", "recording", "the transcript"]
+_VIDEO_KB_KEYWORDS = ["video", "the footage", "the clip", "screen recording"]
 
 _KEYWORDS_BY_KB = {
     "markdown": _MARKDOWN_KB_KEYWORDS,
@@ -212,6 +252,8 @@ _KEYWORDS_BY_KB = {
     "docx": _DOCX_KB_KEYWORDS,
     "web": _WEB_KB_KEYWORDS,
     "github": _GITHUB_KB_KEYWORDS,
+    "audio": _AUDIO_KB_KEYWORDS,
+    "video": _VIDEO_KB_KEYWORDS,
 }
 
 
@@ -221,56 +263,70 @@ def _rule_based_kbs(query_text: str) -> set[str]:
     return {kb for kb, keywords in _KEYWORDS_BY_KB.items() if any(keyword in query_lower for keyword in keywords)}
 
 
-# Small, hand-written example questions per KB, same idea as
-# _ROUTE_EXEMPLARS above but for "which source is this query about"
-# instead of "what kind of chunk".
-_KB_EXEMPLARS: dict[str, list[str]] = {
-    "markdown": [
-        "what does the markdown file say",
-        "summarize the readme file",
-    ],
-    "pdf": [
-        "what does the pdf document say about this",
-        "find this in the pdf report",
-    ],
-    "docx": [
-        "what does the word document say",
-        "find this in the docx file",
-    ],
-    "web": [
-        "what does the website say about this",
-        "find this on the documentation site",
-    ],
-    "github": [
-        "what does the codebase do",
-        "how is this implemented in the github repository",
-    ],
-}
+# How many of a KB's own stored chunk embeddings to sample as its
+# semantic "exemplar set" (see module docstring). 40 mirrors this
+# codebase's other retrieval pool sizes (e.g.
+# app.retrieval.github_adaptive._INTENT_POOL_SIZE) - enough to capture
+# real topical variety within a KB without making the sample fetch
+# itself expensive.
+_KB_SAMPLE_SIZE = 40
 
-# Same threshold as _SEMANTIC_ROUTE_THRESHOLD (see that constant's
-# comment) - KB exemplars are similarly short, topic-focused sentences,
-# so the same cutoff that works for content-type routing applies here
-# too.
-_SEMANTIC_KB_THRESHOLD = 0.4
+# Real stored chunks are longer and noisier than the short, clean,
+# question-shaped sentences _ROUTE_EXEMPLARS uses, so genuine on-topic
+# matches score lower on raw cosine similarity than they would against
+# a hand-written exemplar - this threshold is deliberately looser than
+# _SEMANTIC_ROUTE_THRESHOLD's 0.4 for exactly that reason (verified
+# empirically: a real on-topic query scored well below 0.4 but clearly
+# above generic/unrelated queries when compared against real chunk
+# samples).
+_SEMANTIC_KB_THRESHOLD = 0.2
 
-_kb_exemplar_embeddings_cache: dict[str, list[list[float]]] | None = None
+_kb_sample_embeddings_cache: dict[str, list[list[float]]] | None = None
 
 
-def _get_kb_exemplar_embeddings() -> dict[str, list[list[float]]]:
-    """Lazily embed every KB's exemplars once, then cache in memory."""
-    global _kb_exemplar_embeddings_cache
-    if _kb_exemplar_embeddings_cache is None:
-        _kb_exemplar_embeddings_cache = {kb: embed_texts(exemplars) for kb, exemplars in _KB_EXEMPLARS.items()}
-    return _kb_exemplar_embeddings_cache
+def _get_kb_sample_embeddings() -> dict[str, list[list[float]]]:
+    """Lazily sample + cache each KB's real stored chunk embeddings.
+    See invalidate_kb_routing_cache() for how this stays fresh as
+    content is ingested/deleted."""
+    global _kb_sample_embeddings_cache
+    if _kb_sample_embeddings_cache is None:
+        _kb_sample_embeddings_cache = {
+            kb: sample_kb_embeddings(kb, limit=_KB_SAMPLE_SIZE) for kb in KB_NAMES
+        }
+    return _kb_sample_embeddings_cache
+
+
+def invalidate_kb_routing_cache(kb: str | None = None) -> None:
+    """
+    Drop the cached corpus-derived KB samples so the next routing
+    decision re-samples fresh content. Called by
+    app.vectorstore.store._invalidate_hybrid_cache whenever any KB's
+    stored chunks change (ingest/delete) - same trigger points as the
+    BM25 cache's own invalidation.
+
+    Always clears every KB's sample (ignores `kb`, kept only so the
+    call shape matches invalidate_bm25_cache's) rather than dropping
+    just one - re-sampling all 5 KBs is cheap (a handful of small
+    Chroma lookups), and this avoids a whole class of partial-
+    staleness bugs a per-KB clear would need to get right.
+    """
+    global _kb_sample_embeddings_cache
+    _kb_sample_embeddings_cache = None
 
 
 def _semantic_kbs(query_vector: list[float]) -> dict[str, float]:
-    """Same idea as _semantic_routes(), scored against KB exemplars instead of route exemplars."""
-    exemplar_embeddings = _get_kb_exemplar_embeddings()
-    return {
-        kb: max(_cosine_similarity(query_vector, exemplar) for exemplar in exemplars)
-        for kb, exemplars in exemplar_embeddings.items()
-    }
+    """Score each KB by how close the query is to a random sample of
+    that KB's OWN real stored content (see module docstring) - a KB
+    with no chunks yet (or that sampled to empty) scores 0.0 for every
+    query, same as having no semantic signal to offer."""
+    samples = _get_kb_sample_embeddings()
+    scores: dict[str, float] = {}
+    for kb, embeddings in samples.items():
+        if not embeddings:
+            scores[kb] = 0.0
+            continue
+        scores[kb] = max(_cosine_similarity(query_vector, embedding) for embedding in embeddings)
+    return scores
 
 
 # ---- Hybrid combination / multi-retriever routing -----------------------

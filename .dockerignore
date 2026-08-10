@@ -1,0 +1,20 @@
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.streamlit/
+.env
+
+# Regenerable/local - re-created inside the container or supplied via
+# the docker-compose ./data bind mount at runtime, not baked into the
+# image (mirrors .gitignore's own list, plus data/media which the
+# image needs a shell to create but not to contain host media copies).
+data/chroma_db/
+data/graphs/
+data/media/
+data/*.log
+data/pending_documents.json

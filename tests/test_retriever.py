@@ -22,28 +22,24 @@ def _default_general_route(monkeypatch):
     unless a test explicitly overrides this fixture's monkeypatch
     (later monkeypatch.setattr calls in a test body win), so the vast
     majority of retriever tests - which aren't testing routing at all
-    - never load the real model and keep behaving exactly as they did
-    before routing existed (a single, unfiltered query_embedding call).
+    - never load the real model.
 
     Also default list_populated_kbs() (used as the fallback when a
-    RouteDecision carries no explicit .kbs signal) to a single fake KB
-    name, rather than letting it fall through to the real vector store
-    on disk - this keeps the "one unfiltered query_embedding call per
-    matched route" assumption most pre-existing tests rely on true
-    regardless of the multi-KB split.
+    RouteDecision carries no explicit .kbs signal) to "markdown" - an
+    ordinary hybrid KB - rather than letting it fall through to the
+    real vector store on disk.
 
-    "_dense_only_test_kb" is a deliberately fake name that isn't in
-    any real KB set: every real KB (pdf, docx, markdown, github, web)
-    now goes through hybrid_retriever, which BYPASSES retriever.py's
-    query_embedding() call that these tests mock directly. Using a
-    non-hybrid name keeps the dispatch on the plain per-route dense
-    loop so mocking query_embedding still fully controls what these
-    tests see.
+    Every real KB now goes through either app.retrieval.github_adaptive
+    (for "github") or app.retrieval.hybrid_retriever.retrieve_hybrid
+    (for pdf/docx/markdown/web, and github's cross-KB slice used to
+    before this fix - see retrieve()'s module docstring) - there is no
+    more per-route dense-only dispatch to mock query_embedding
+    against, so every test here mocks retrieve_hybrid directly.
     """
     monkeypatch.setattr(
         retriever, "classify_route", lambda query_text: RouteDecision(["general"], "default", {})
     )
-    monkeypatch.setattr(retriever, "list_populated_kbs", lambda: ["_dense_only_test_kb"])
+    monkeypatch.setattr(retriever, "list_populated_kbs", lambda: ["markdown"])
 
 
 def test_retrieve_embeds_query_and_forwards_to_vector_store(monkeypatch):
@@ -53,34 +49,34 @@ def test_retrieve_embeds_query_and_forwards_to_vector_store(monkeypatch):
         captured["texts"] = texts
         return [[0.1, 0.2, 0.3]]
 
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
-        captured["vector"] = vector
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
+        captured["vector"] = query_vector
         captured["top_k"] = top_k
         return [{"content": "hello", "metadata": {}, "distance": 0.1, "similarity": 0.9}]
 
     monkeypatch.setattr(retriever, "embed_texts", fake_embed_texts)
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
 
     results = retriever.retrieve("what is RAG", top_k=2)
 
     assert captured["texts"] == ["what is RAG"]
     assert captured["vector"] == [0.1, 0.2, 0.3]
-    # retrieve() asks the vector store for a wider candidate pool than
-    # top_k (see _rerank_by_title_overlap's docstring) - it only
-    # truncates to top_k after reranking, not before.
-    assert captured["top_k"] == 50
+    # retrieve_hybrid manages its own internal candidate pools
+    # (_DENSE_POOL_SIZE/_BM25_POOL_SIZE/_RERANK_POOL_SIZE) - retrieve()
+    # just forwards the caller's real top_k straight through.
+    assert captured["top_k"] == 2
     assert results == [{"content": "hello", "metadata": {}, "distance": 0.1, "similarity": 0.9}]
 
 
 def test_retrieve_passes_no_where_filter_by_default(monkeypatch):
     captured = {}
 
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
         captured["where"] = where
         return []
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
 
     retriever.retrieve("a question")
 
@@ -90,87 +86,70 @@ def test_retrieve_passes_no_where_filter_by_default(monkeypatch):
 def test_retrieve_scopes_to_a_repository_when_given(monkeypatch):
     captured = {}
 
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
         captured["where"] = where
         return []
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
 
     retriever.retrieve("a question", repository="owner/repo")
 
     assert captured["where"] == {"repository": "owner/repo"}
 
 
-def test_retrieve_runs_one_query_per_matched_route_with_content_type_filters(monkeypatch):
-    # A query routed to both "code" and "general" against a KB that
-    # still uses the per-route dense loop should run TWO separate
-    # query_embedding calls - one scoped to code content types, one
-    # unscoped - rather than a single call, since these are genuinely
-    # separate retrievers being combined (see app.routing.router's
-    # "multi-retriever routing").
-    #
-    # The "code" content_type filter only ever matches in the "github"
-    # KB in production. But github now goes through hybrid_retriever
-    # (which subsumes route-based dispatch into its dense + BM25 +
-    # cross-encoder + parent-child ensemble), so this test uses a
-    # synthetic "_dense_only_test_kb" that isn't in _HYBRID_KBS to
-    # keep exercising the per-route dense loop that this test is
-    # actually about. The code content_type restriction in
-    # _ROUTE_CONTENT_TYPE_KB_RESTRICTION is loosened for the same
-    # reason - the test doesn't care which KB code-typed chunks live
-    # in, only that a code-routed query issues a filtered call.
+def test_retrieve_runs_an_additional_query_when_the_table_route_matches(monkeypatch):
+    # A query routed to both "table" and "general" should run TWO
+    # separate retrieve_hybrid calls for the same KB - one scoped to
+    # table content types, one unscoped - since these are genuinely
+    # separate retrievers being combined, not a replacement (see
+    # retrieve()'s docstring on the "table" route).
     calls = []
 
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
         calls.append(where)
         return []
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(
         retriever,
         "classify_route",
-        lambda query_text: RouteDecision(["code", "general"], "rule", {}, kbs=["_dense_only_test_kb"]),
+        lambda query_text: RouteDecision(["table", "general"], "rule", {}, kbs=["markdown"]),
     )
-    # The production restriction says "code" content_type only exists
-    # in the github KB. Bypass it for this test so the code route
-    # actually issues a query for the synthetic KB.
-    monkeypatch.setattr(retriever, "_ROUTE_CONTENT_TYPE_KB_RESTRICTION", {})
 
-    retriever.retrieve("show me the function that validates input")
+    retriever.retrieve("what does this table show?")
 
     assert len(calls) == 2
-    assert {"content_type": {"$in": ["class", "method", "function"]}} in calls
+    assert {"content_type": {"$in": ["table", "table_row"]}} in calls
     assert None in calls
 
 
+def test_retrieve_combines_repository_scope_with_the_table_route_filter(monkeypatch):
+    captured_wheres = []
 
-def test_retrieve_combines_repository_scope_with_a_route_content_type_filter(monkeypatch):
-    captured = {}
-
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
-        captured["where"] = where
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
+        captured_wheres.append(where)
         return []
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(retriever, "classify_route", lambda query_text: RouteDecision(["table"], "rule", {}))
 
     retriever.retrieve("what is in this table?", repository="owner/repo")
 
-    assert captured["where"] == {
+    assert {
         "$and": [{"repository": "owner/repo"}, {"content_type": {"$in": ["table", "table_row"]}}]
-    }
+    } in captured_wheres
 
 
-def test_retrieve_merges_and_dedupes_candidates_from_multiple_routes(monkeypatch):
-    # The same chunk showing up in both the "code"-scoped query and the
-    # unscoped "general" query (entirely plausible - a code chunk is
+def test_retrieve_merges_and_dedupes_candidates_from_the_table_and_general_routes(monkeypatch):
+    # The same chunk showing up in both the table-scoped query and the
+    # unscoped "general" query (entirely plausible - a table chunk is
     # part of the general corpus too) should only appear once.
     shared_hit = {
-        "content": "def foo(): ...",
-        "metadata": {"document_id": "foo.py", "chunk_index": 0, "content_type": "function"},
+        "content": "| A | B |\n| --- | --- |\n| 1 | 2 |",
+        "metadata": {"document_id": "doc.md", "chunk_index": 0, "content_type": "table"},
         "distance": 0.1,
         "similarity": 0.9,
     }
@@ -181,18 +160,18 @@ def test_retrieve_merges_and_dedupes_candidates_from_multiple_routes(monkeypatch
         "similarity": 0.7,
     }
 
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
         if where is not None:
             return [shared_hit]
         return [shared_hit, only_in_general]
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(
-        retriever, "classify_route", lambda query_text: RouteDecision(["code", "general"], "rule", {})
+        retriever, "classify_route", lambda query_text: RouteDecision(["table", "general"], "rule", {})
     )
 
-    results = retriever.retrieve("show me the function foo", top_k=5)
+    results = retriever.retrieve("what's in the table", top_k=5)
 
     assert len(results) == 2
     assert shared_hit in results
@@ -201,15 +180,15 @@ def test_retrieve_merges_and_dedupes_candidates_from_multiple_routes(monkeypatch
 
 def test_retrieve_skips_the_image_route_entirely_for_text_search(monkeypatch):
     # "image" isn't a text-collection content_type filter at all - it
-    # should never trigger an extra query_embedding call on its own.
+    # should never trigger an extra retrieve_hybrid call on its own.
     calls = []
 
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
         calls.append(where)
         return []
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(
         retriever, "classify_route", lambda query_text: RouteDecision(["general", "image"], "rule", {})
     )
@@ -222,18 +201,16 @@ def test_retrieve_skips_the_image_route_entirely_for_text_search(monkeypatch):
 def test_retrieve_default_top_k_is_five(monkeypatch):
     captured = {}
 
-    def fake_query_embedding(vector, top_k, where=None, kb=None):
+    def fake_retrieve_hybrid(query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None):
         captured["top_k"] = top_k
         return []
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", fake_query_embedding)
+    monkeypatch.setattr(retriever, "retrieve_hybrid", fake_retrieve_hybrid)
 
     retriever.retrieve("a question")
 
-    # Candidate pool is max(top_k * 10, 50); for the default top_k=5
-    # that's still 50.
-    assert captured["top_k"] == 50
+    assert captured["top_k"] == 5
 
 
 def test_retrieve_prefers_readme_intro_chunk_for_generic_overview_question(monkeypatch):
@@ -266,8 +243,10 @@ def test_retrieve_prefers_readme_intro_chunk_for_generic_overview_question(monke
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
     monkeypatch.setattr(
         retriever,
-        "query_embedding",
-        lambda vector, top_k, where=None, kb=None: [changelog_hit, readme_subsection_hit, readme_intro_hit],
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [
+            changelog_hit, readme_subsection_hit, readme_intro_hit,
+        ],
     )
 
     results = retriever.retrieve("what is the repository about", top_k=1)
@@ -294,7 +273,11 @@ def test_retrieve_does_not_boost_readme_for_unrelated_questions(monkeypatch):
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
     monkeypatch.setattr(
-        retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [readme_hit, specific_hit]
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [
+            readme_hit, specific_hit,
+        ],
     )
 
     results = retriever.retrieve("does load_dotenv override existing environment variables?", top_k=1)
@@ -323,7 +306,11 @@ def test_retrieve_replaces_a_retrieved_table_row_with_the_complete_table(monkeyp
     }
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [row_hit])
+    monkeypatch.setattr(
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [row_hit],
+    )
     monkeypatch.setattr(
         retriever, "get_table_chunk", lambda table_id: full_table if table_id == "doc.md::table_0" else None
     )
@@ -350,7 +337,13 @@ def test_retrieve_does_not_duplicate_the_table_when_it_is_already_a_direct_hit(m
     }
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [table_hit, row_hit])
+    monkeypatch.setattr(
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [
+            table_hit, row_hit,
+        ],
+    )
 
     def fail_if_called(table_id):
         raise AssertionError("get_table_chunk should not be called when the table is already a direct hit")
@@ -373,7 +366,11 @@ def test_retrieve_leaves_non_table_chunks_untouched(monkeypatch):
     }
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [paragraph_hit])
+    monkeypatch.setattr(
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [paragraph_hit],
+    )
 
     results = retriever.retrieve("a question", top_k=3)
 
@@ -399,7 +396,11 @@ def test_retrieve_replaces_a_retrieved_method_with_the_complete_class(monkeypatc
     }
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [method_hit])
+    monkeypatch.setattr(
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [method_hit],
+    )
     monkeypatch.setattr(
         retriever, "get_class_chunk", lambda class_id: full_class if class_id == "foo.py::class_0" else None
     )
@@ -426,7 +427,13 @@ def test_retrieve_does_not_duplicate_the_class_when_it_is_already_a_direct_hit(m
     }
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [class_hit, method_hit])
+    monkeypatch.setattr(
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [
+            class_hit, method_hit,
+        ],
+    )
 
     def fail_if_called(class_id):
         raise AssertionError("get_class_chunk should not be called when the class is already a direct hit")
@@ -449,7 +456,11 @@ def test_retrieve_leaves_non_method_code_chunks_untouched(monkeypatch):
     }
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [function_hit])
+    monkeypatch.setattr(
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [function_hit],
+    )
 
     results = retriever.retrieve("a question", top_k=3)
 
@@ -481,7 +492,13 @@ def test_retrieve_promotes_a_title_matching_chunk_over_a_higher_similarity_one(m
     }
 
     monkeypatch.setattr(retriever, "embed_texts", lambda texts: [[0.0]])
-    monkeypatch.setattr(retriever, "query_embedding", lambda vector, top_k, where=None, kb=None: [unrelated_hit, title_match_hit])
+    monkeypatch.setattr(
+        retriever,
+        "retrieve_hybrid",
+        lambda query_text, query_vector, kb, top_k, where=None, variants=None, hyde_answer=None, keywords=None: [
+            unrelated_hit, title_match_hit,
+        ],
+    )
 
     results = retriever.retrieve(
         "Assign the people working on a Task to its User Story when the User Story is set",
@@ -498,7 +515,7 @@ def test_retrieve_images_embeds_query_with_clip_and_forwards_to_image_collection
         captured["text"] = text
         return [0.1, 0.2]
 
-    def fake_query_image_embedding(vector, top_k):
+    def fake_query_image_embedding(vector, top_k, where=None):
         captured["vector"] = vector
         captured["top_k"] = top_k
         return [
@@ -528,7 +545,7 @@ def test_retrieve_images_embeds_query_with_clip_and_forwards_to_image_collection
 def test_retrieve_images_default_top_k_is_three(monkeypatch):
     captured = {}
 
-    def fake_query_image_embedding(vector, top_k):
+    def fake_query_image_embedding(vector, top_k, where=None):
         captured["top_k"] = top_k
         return []
 
@@ -564,7 +581,7 @@ def test_retrieve_images_promotes_an_alt_text_matching_image_over_a_higher_simil
 
     monkeypatch.setattr(retriever, "embed_text_for_image_search", lambda text: [0.0])
     monkeypatch.setattr(
-        retriever, "query_image_embedding", lambda vector, top_k: [unrelated_hit, alt_text_match_hit]
+        retriever, "query_image_embedding", lambda vector, top_k, where=None: [unrelated_hit, alt_text_match_hit]
     )
 
     results = retriever.retrieve_images(
@@ -573,3 +590,116 @@ def test_retrieve_images_promotes_an_alt_text_matching_image_over_a_higher_simil
     )
 
     assert results == [alt_text_match_hit]
+
+
+def test_retrieve_audio_clips_embeds_query_with_clap_and_forwards_to_audio_collection(monkeypatch):
+    captured = {}
+
+    def fake_embed_text_for_audio_search(text):
+        captured["text"] = text
+        return [0.1, 0.2]
+
+    def fake_query_audio_clip_embedding(vector, top_k, where=None):
+        captured["vector"] = vector
+        captured["top_k"] = top_k
+        return [
+            {
+                "content": "Clip from meeting.mp3 at 00:00",
+                "metadata": {"document_id": "meeting.mp3", "start_seconds": 0.0},
+                "distance": 0.1,
+                "similarity": 0.9,
+            }
+        ]
+
+    monkeypatch.setattr(retriever, "embed_text_for_audio_search", fake_embed_text_for_audio_search)
+    monkeypatch.setattr(retriever, "query_audio_clip_embedding", fake_query_audio_clip_embedding)
+
+    results = retriever.retrieve_audio_clips("find audio that sounds like rain", top_k=2)
+
+    assert captured["text"] == "find audio that sounds like rain"
+    assert captured["vector"] == [0.1, 0.2]
+    # Unlike retrieve_images(), no wide-pool override - top_k passes
+    # straight through (see retrieve_audio_clips's own docstring for
+    # why the rerank treatment isn't copied here).
+    assert captured["top_k"] == 2
+    assert results[0]["content"] == "Clip from meeting.mp3 at 00:00"
+
+
+def test_retrieve_audio_clips_default_top_k_is_three(monkeypatch):
+    captured = {}
+
+    def fake_query_audio_clip_embedding(vector, top_k, where=None):
+        captured["top_k"] = top_k
+        return []
+
+    monkeypatch.setattr(retriever, "embed_text_for_audio_search", lambda text: [0.0])
+    monkeypatch.setattr(retriever, "query_audio_clip_embedding", fake_query_audio_clip_embedding)
+
+    retriever.retrieve_audio_clips("a question")
+
+    assert captured["top_k"] == 3
+
+
+def test_retrieve_audio_clips_scopes_to_kb_when_given(monkeypatch):
+    # Regression test for a real bug: without this filter, a question
+    # asked about one specific ingested video surfaced an unrelated
+    # audio clip from a completely different file, since the
+    # audio-clip collection has no other notion of "which KB" a clip
+    # belongs to (see retrieve_audio_clips's own docstring).
+    captured = {}
+
+    def fake_query_audio_clip_embedding(vector, top_k, where=None):
+        captured["where"] = where
+        return []
+
+    monkeypatch.setattr(retriever, "embed_text_for_audio_search", lambda text: [0.0])
+    monkeypatch.setattr(retriever, "query_audio_clip_embedding", fake_query_audio_clip_embedding)
+
+    retriever.retrieve_audio_clips("a question", kb="video")
+
+    assert captured["where"] == {"source_kb": "video"}
+
+
+def test_retrieve_audio_clips_applies_no_filter_for_cross_kb_chat(monkeypatch):
+    captured = {}
+
+    def fake_query_audio_clip_embedding(vector, top_k, where=None):
+        captured["where"] = where
+        return []
+
+    monkeypatch.setattr(retriever, "embed_text_for_audio_search", lambda text: [0.0])
+    monkeypatch.setattr(retriever, "query_audio_clip_embedding", fake_query_audio_clip_embedding)
+
+    retriever.retrieve_audio_clips("a question", kb=None)
+
+    assert captured["where"] is None
+
+
+def test_retrieve_images_scopes_to_kb_when_given(monkeypatch):
+    captured = {}
+
+    def fake_query_image_embedding(vector, top_k, where=None):
+        captured["where"] = where
+        return []
+
+    monkeypatch.setattr(retriever, "embed_text_for_image_search", lambda text: [0.0])
+    monkeypatch.setattr(retriever, "query_image_embedding", fake_query_image_embedding)
+
+    retriever.retrieve_images("a question", kb="video")
+
+    assert captured["where"] == {"source_kb": "video"}
+
+
+def test_retrieve_images_applies_no_filter_for_cross_kb_chat(monkeypatch):
+    captured = {}
+
+    def fake_query_image_embedding(vector, top_k, where=None):
+        captured["where"] = where
+        return []
+
+    monkeypatch.setattr(retriever, "embed_text_for_image_search", lambda text: [0.0])
+    monkeypatch.setattr(retriever, "query_image_embedding", fake_query_image_embedding)
+
+    retriever.retrieve_images("a question", kb=None)
+
+    assert captured["where"] is None

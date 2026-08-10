@@ -1,0 +1,55 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    # `ollama` (the CLI, also this image's own entrypoint binary) only
+    # succeeds once the server is actually accepting requests - lets
+    # `app` wait for a genuinely ready Ollama instead of just a
+    # started container (see `depends_on` below).
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      # BIND_ADDRESS controls which host network interface port 8000 is
+      # published on. Default 0.0.0.0 = reachable from your whole LAN
+      # (matches "deploy on my own machine so other devices can reach
+      # it"). Set BIND_ADDRESS=127.0.0.1 in .env to restrict this to
+      # the host machine only (e.g. if a reverse proxy in front is the
+      # only intended entry point).
+      - "${BIND_ADDRESS:-0.0.0.0}:8000:8000"
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      APP_PASSWORD: ${APP_PASSWORD:-}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-base}
+      ENABLE_AUDIO_SIMILARITY_SEARCH: ${ENABLE_AUDIO_SIMILARITY_SEARCH:-0}
+    volumes:
+      # All persistent app state (Chroma DB, media, code graphs,
+      # session/pending-doc tracker, eval datasets) nests under one
+      # data/ root - see app/vectorstore/store.py, app/media/media_store.py,
+      # app/graph/code_graph.py, session_store.py, api/evaluation.py.
+      - ./data:/app/data
+      # Model download caches, kept out of the ./data bind mount so a
+      # rebuild doesn't re-download multi-GB weights (HuggingFace/torch/
+      # sentence-transformers under ~/.cache, EasyOCR under ~/.EasyOCR).
+      - model-cache:/root/.cache
+      - easyocr-cache:/root/.EasyOCR
+
+volumes:
+  ollama-data:
+  model-cache:
+  easyocr-cache:

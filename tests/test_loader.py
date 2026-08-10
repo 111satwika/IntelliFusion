@@ -7,6 +7,7 @@ import pytest
 import requests
 from fpdf import FPDF
 
+from app.ingestion import loader
 from app.ingestion.loader import (
     _flatten_ibm_docs_topics,
     _ibm_docs_product_path,
@@ -15,12 +16,18 @@ from app.ingestion.loader import (
     crawl_ibm_docs,
     crawl_website,
     extract_image_records,
+    load_audio_document,
     load_docx_document,
+    load_github_discussions,
+    load_github_issues,
+    load_github_pull_requests,
     load_github_repository,
     load_markdown_document,
     load_pdf_document,
+    load_video_document,
     load_website_document,
 )
+from app.ocr.frame_analysis import FrameAnalysis
 
 
 def _make_pdf(path, pages_text: list[str]) -> None:
@@ -239,6 +246,122 @@ def test_load_docx_document_serializes_tables_as_markdown(tmp_path):
 def test_load_docx_document_missing_file_raises():
     with pytest.raises(FileNotFoundError):
         load_docx_document("does_not_exist.docx")
+
+
+# ---------------------------------------------------------------------
+# Audio / video loaders - the real Whisper model / OpenCV frame decode
+# are NOT used here. _transcribe_audio, _sample_video_frames, and
+# _video_duration_seconds are monkeypatched directly on the loader
+# module (matching this file's existing "fake the network/model call,
+# assert on the returned Document" convention), so these tests run
+# fast and deterministically instead of loading a real model per run.
+# ---------------------------------------------------------------------
+
+
+class _FakeSegment:
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+
+
+def test_load_audio_document_builds_timestamped_transcript(tmp_path, monkeypatch):
+    audio_path = tmp_path / "meeting.mp3"
+    audio_path.write_bytes(b"fake audio bytes")
+
+    segments = [_FakeSegment(0.0, 2.5, "hello world"), _FakeSegment(65.0, 68.0, "this is a test")]
+    monkeypatch.setattr(loader, "_transcribe_audio", lambda path: (segments, 68.0))
+
+    document = load_audio_document(str(audio_path))
+
+    assert "[00:00] hello world" in document.content
+    assert "[01:05] this is a test" in document.content
+    assert document.metadata["source_type"] == "audio"
+    assert document.metadata["file_name"] == "meeting.mp3"
+    assert document.metadata["document_id"] == "meeting.mp3"
+    assert document.metadata["duration_seconds"] == 68.0
+
+
+def test_load_audio_document_empty_transcript_when_no_speech_found(tmp_path, monkeypatch):
+    audio_path = tmp_path / "silence.wav"
+    audio_path.write_bytes(b"fake audio bytes")
+
+    monkeypatch.setattr(loader, "_transcribe_audio", lambda path: ([], 2.0))
+
+    document = load_audio_document(str(audio_path))
+
+    assert document.content == ""
+    assert document.metadata["duration_seconds"] == 2.0
+
+
+def test_load_audio_document_missing_file_raises():
+    with pytest.raises(FileNotFoundError):
+        load_audio_document("does_not_exist.mp3")
+
+
+def test_load_video_document_merges_transcript_and_frame_text_in_timestamp_order(tmp_path, monkeypatch):
+    video_path = tmp_path / "tutorial.mp4"
+    video_path.write_bytes(b"fake video bytes")
+
+    segments = [_FakeSegment(0.0, 3.0, "let me show you this function")]
+    monkeypatch.setattr(loader, "_transcribe_audio", lambda path: (segments, 20.0))
+    monkeypatch.setattr(loader, "_video_duration_seconds", lambda path: 20.0)
+
+    fake_frames = [(1.0, "frame_at_1s"), (2.0, "frame_at_2s")]
+    monkeypatch.setattr(
+        loader, "_sample_video_frames", lambda path, interval, duration: iter(fake_frames)
+    )
+
+    def fake_analyze(frame):
+        # frame is whatever _sample_video_frames yielded as the second
+        # tuple element (a placeholder string here, a real PIL.Image in
+        # production) - analyze_frame's real signature doesn't care.
+        if frame == "frame_at_1s":
+            return FrameAnalysis(text="def close_request():", image_type="code")
+        return FrameAnalysis(text="", image_type="other")  # no meaningful text at 2s
+
+    monkeypatch.setattr(loader, "analyze_frame", fake_analyze)
+
+    document = load_video_document(str(video_path), frame_interval_seconds=1, max_frames=60)
+
+    lines = document.content.splitlines()
+    assert lines == [
+        "[00:00] let me show you this function",
+        "[00:01] [Frame text: def close_request():]",
+    ]
+    assert document.metadata["source_type"] == "video"
+    assert document.metadata["duration_seconds"] == 20.0
+    assert document.metadata["frame_count_sampled"] == 2  # both sampled frames counted, even the empty one
+
+
+def test_load_video_document_widens_interval_for_long_videos_instead_of_truncating(tmp_path, monkeypatch):
+    video_path = tmp_path / "long.mp4"
+    video_path.write_bytes(b"fake video bytes")
+
+    monkeypatch.setattr(loader, "_transcribe_audio", lambda path: ([], 1200.0))  # 20-minute video
+    monkeypatch.setattr(loader, "_video_duration_seconds", lambda path: 1200.0)
+
+    captured = {}
+
+    def fake_sample(path, interval, duration):
+        captured["interval"] = interval
+        captured["duration"] = duration
+        return iter([])
+
+    monkeypatch.setattr(loader, "_sample_video_frames", fake_sample)
+
+    load_video_document(str(video_path), frame_interval_seconds=10, max_frames=60)
+
+    # 1200s / 60 frames = 20s/frame, wider than the 10s default - the
+    # interval must widen automatically rather than sampling only the
+    # first 600s (60 frames * 10s) and silently dropping the rest.
+    assert captured["interval"] == 20.0
+    assert captured["duration"] == 1200.0
+
+
+def test_load_video_document_missing_file_raises():
+    with pytest.raises(FileNotFoundError):
+        load_video_document("does_not_exist.mp4")
 
 
 def _mock_response(html: str, status_ok: bool = True):
@@ -723,6 +846,132 @@ def test_load_github_repository_caps_at_max_files(monkeypatch):
     documents = load_github_repository("owner/repo", branch="main", max_files=2)
 
     assert len(documents) == 2
+
+
+def test_load_github_issues_filters_out_pull_requests_and_paginates(monkeypatch):
+    page1 = [
+        {"number": 2, "title": "Second issue", "body": "b2", "state": "open", "user": {"login": "a"}, "html_url": "u2"},
+        {"number": 1, "title": "A PR", "body": "b1", "state": "open", "pull_request": {"url": "x"}},
+    ]
+    page2 = [
+        {"number": 3, "title": "Third issue", "body": None, "state": "closed", "user": {"login": "b"}, "html_url": "u3"},
+    ]
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        assert url == "https://api.github.com/repos/owner/repo/issues"
+        if params["page"] == 1:
+            return _mock_json_response(page1)
+        if params["page"] == 2:
+            return _mock_json_response(page2)
+        return _mock_json_response([])
+
+    monkeypatch.setattr("app.ingestion.loader.requests.get", Mock(side_effect=fake_get))
+    # Force pagination to advance one page at a time regardless of the
+    # real API's 100/page cap, so this test doesn't need 100 fake items.
+    monkeypatch.setattr("app.ingestion.loader._ACTIVITY_API_MAX_PER_PAGE", 2)
+
+    documents = load_github_issues("owner", "repo")
+
+    assert [doc.metadata["number"] for doc in documents] == [2, 3]
+    assert documents[0].metadata["content_type"] == "issue"
+    assert documents[0].metadata["repository"] == "owner/repo"
+    assert documents[0].metadata["source_type"] == "code"
+    assert documents[0].metadata["document_id"] == "owner/repo:issue:2"
+    assert "Second issue" in documents[0].content
+    assert "(no description provided)" in documents[1].content
+
+
+def test_load_github_issues_caps_at_max_items(monkeypatch):
+    page = [
+        {"number": i, "title": f"Issue {i}", "body": "b", "state": "open", "user": {}, "html_url": "u"}
+        for i in range(1, 6)
+    ]
+    monkeypatch.setattr(
+        "app.ingestion.loader.requests.get", Mock(return_value=_mock_json_response(page))
+    )
+
+    documents = load_github_issues("owner", "repo", max_items=3)
+
+    assert len(documents) == 3
+
+
+def test_load_github_pull_requests_basic(monkeypatch):
+    page = [
+        {"number": 5, "title": "Add feature", "body": "details", "state": "open", "user": {"login": "c"}, "html_url": "u5"},
+    ]
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        assert url == "https://api.github.com/repos/owner/repo/pulls"
+        if params["page"] == 1:
+            return _mock_json_response(page)
+        return _mock_json_response([])
+
+    monkeypatch.setattr("app.ingestion.loader.requests.get", Mock(side_effect=fake_get))
+
+    documents = load_github_pull_requests("owner", "repo")
+
+    assert len(documents) == 1
+    assert documents[0].metadata["content_type"] == "pull_request"
+    assert documents[0].metadata["document_id"] == "owner/repo:pr:5"
+
+
+def test_load_github_discussions_requires_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="GITHUB_TOKEN"):
+        load_github_discussions("owner", "repo")
+
+
+def test_load_github_discussions_paginates_via_graphql(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        assert url == "https://api.github.com/graphql"
+        after = json["variables"]["after"]
+        if after is None:
+            data = {
+                "repository": {
+                    "discussions": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor1"},
+                        "nodes": [
+                            {"number": 1, "title": "Discussion one", "body": "d1", "url": "du1",
+                             "author": {"login": "x"}, "category": {"name": "Q&A"}},
+                        ],
+                    }
+                }
+            }
+        else:
+            assert after == "cursor1"
+            data = {
+                "repository": {
+                    "discussions": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {"number": 2, "title": "Discussion two", "body": None, "url": "du2",
+                             "author": None, "category": None},
+                        ],
+                    }
+                }
+            }
+        return _mock_json_response({"data": data})
+
+    monkeypatch.setattr("app.ingestion.loader.requests.post", Mock(side_effect=fake_post))
+
+    documents = load_github_discussions("owner", "repo")
+
+    assert [doc.metadata["number"] for doc in documents] == [1, 2]
+    assert documents[0].metadata["content_type"] == "discussion"
+    assert documents[0].metadata["document_id"] == "owner/repo:discussion:1"
+    assert documents[1].metadata["author"] is None
+
+
+def test_load_github_discussions_raises_on_graphql_errors(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    monkeypatch.setattr(
+        "app.ingestion.loader.requests.post",
+        Mock(return_value=_mock_json_response({"errors": [{"message": "Discussions not enabled"}]})),
+    )
+    with pytest.raises(ValueError, match="GraphQL error"):
+        load_github_discussions("owner", "repo")
 
 
 def test_ibm_docs_product_path_strips_prefix_and_query():

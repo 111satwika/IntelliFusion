@@ -372,13 +372,15 @@ def test_retrieve_hybrid_supports_every_hybrid_kb(monkeypatch, kb):
     assert len(results) > 0
 
 
-def test_hybrid_kbs_registry_includes_all_five():
+def test_hybrid_kbs_registry_includes_all_seven():
     """Guardrail: if this set drifts (e.g. a refactor drops docx by
     accident), the retriever's per-KB dispatch would silently fall
     back to plain dense - fail fast here instead. github and web are
     included because they layer parent-child retrieval on top of the
-    same dense+BM25+cross-encoder ensemble."""
-    assert hybrid_retriever._HYBRID_KBS == {"pdf", "docx", "markdown", "github", "web"}
+    same dense+BM25+cross-encoder ensemble. audio/video are hybrid
+    (BM25 catches exact spoken terms/names well) but deliberately NOT
+    in _PARENT_CHILD_KBS - see that set's own docstring."""
+    assert hybrid_retriever._HYBRID_KBS == {"pdf", "docx", "markdown", "github", "web", "audio", "video"}
 
 
 def test_parent_child_kbs_registry():

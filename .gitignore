@@ -13,5 +13,7 @@ venv/
 # and too large / machine-specific to commit).
 data/chroma_db/
 data/raw/
+data/graphs/
+data/media/
 data/*.log
 data/pending_documents.json

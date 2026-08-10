@@ -40,43 +40,37 @@ import logging
 import math
 import re
 
+from app.embeddings.audio_embedder import embed_text_for_audio_search
 from app.embeddings.embedder import embed_texts
 from app.embeddings.image_embedder import embed_text_for_image_search
+from app.retrieval.github_adaptive import retrieve_github_adaptive
 from app.retrieval.hybrid_retriever import _HYBRID_KBS, retrieve_hybrid
+from app.retrieval.query_transform import transform_query
 from app.routing.router import classify_route
 from app.vectorstore.store import (
-    KB_NAMES,
     get_class_chunk,
     get_table_chunk,
     list_populated_kbs,
-    query_embedding,
+    query_audio_clip_embedding,
     query_image_embedding,
 )
 
 logger = logging.getLogger(__name__)
 
-# Which stored content_types each non-"general" text route should be
-# narrowed to (see app.routing.router's module docstring for what each
-# route means). "general"/"image" are deliberately absent here:
-# "general" means no content_type filter at all (today's default,
-# unscoped behavior), and "image" isn't a text-collection filter at
-# all - it's a signal for callers to ALSO query the separate CLIP
-# image retriever (see retrieve_images() below), which retrieve()
-# itself never touches.
+# Which stored content_types the "table" route should be narrowed to
+# (see app.routing.router's module docstring for what the route
+# means) - a table can appear in a markdown file, a PDF, a DOCX, or a
+# GitHub repo's own docs, so it's applied to every hybrid KB actually
+# being searched. There used to be a "code" entry here too (for the
+# github KB's class/method/function chunks), but github chunks are no
+# longer routed through content_type filtering at all - see retrieve()
+# below, which dispatches "github" through
+# app.retrieval.github_adaptive's own exact_code/structural intents
+# instead, a strictly more precise (symbol-scoped, not just
+# content-type-scoped) mechanism for the same job.
 _ROUTE_CONTENT_TYPES = {
-    "code": ["class", "method", "function"],
     "table": ["table", "table_row"],
 }
-
-# The "code" content_type filter only ever matches chunks in the
-# "github" KB (AST class/method/function chunking only happens for
-# Python files loaded via app.ingestion.loader.load_github_repository
-# - see app.chunking.code_chunker) - running it against any other KB
-# would just waste a query on a filter that can never match there. The
-# "table" filter has no such restriction: a table can appear in a
-# markdown file, a PDF, a DOCX, or a GitHub repo's own docs, so it's
-# applied to every KB actually being searched.
-_ROUTE_CONTENT_TYPE_KB_RESTRICTION = {"code": "github"}
 
 
 # How much weight the title/heading lexical-overlap boost gets relative
@@ -304,6 +298,8 @@ def retrieve(
     top_k: int = 5,
     repository: str | None = None,
     kb: str | None = None,
+    *,
+    query_transform_enabled: bool | None = None,
 ) -> list[dict]:
     """
     Find the top_k chunks most relevant to a user's question.
@@ -337,17 +333,15 @@ def retrieve(
        searched (list_populated_kbs()) rather than every KB
        unconditionally, so a KB nothing was ever ingested into is
        skipped for free.
-    2. WHICH content_type(s) to additionally filter for within each
-       searched KB (decision.routes, e.g. "code", "table", plus always
-       "general"). Each matched route runs as its OWN separate,
-       content_type-scoped query_embedding() call per KB - a real,
-       additional retriever, not just a rerank tweak - and every
-       route's candidates, across every KB, are merged (deduped by
-       document_id/chunk_index) before reranking. Because "general"
-       (today's unscoped search) is always one of the routes, a wrong
-       or low-confidence routing decision can only ADD extra,
-       more-targeted candidates - it never removes anything the
-       unscoped search within a searched KB would already have found.
+    2. WHETHER the "table" route additionally fires (decision.routes,
+       threshold >= 0.55 - see app.routing.router). When it does, each
+       hybrid KB gets a SECOND, content_type-scoped retrieve_hybrid()
+       pass (content_type in ["table", "table_row"]) on top of the
+       unscoped pass, and both sets of candidates are merged (deduped
+       by document_id/chunk_index) before reranking - so a query that
+       clearly signals "I'm asking about a table" can only ever ADD a
+       targeted retriever alongside the general one, never replace or
+       narrow it.
 
     Returns:
         A list of dicts, each with "content", "metadata", "distance"
@@ -366,32 +360,27 @@ def retrieve(
         target_kbs = [kb]
     else:
         target_kbs = decision.kbs or list_populated_kbs()
-    # Fetch a wider candidate pool than top_k so _rerank_by_title_overlap
-    # has enough rank-adjacent candidates to promote a correct chunk
-    # that plain embedding similarity ranked just outside top_k, rather
-    # than only ever reranking within an already-truncated list. 25 was
-    # too narrow in practice: a query phrased as a natural-language
-    # question around an exact title (rather than the title alone) can
-    # push the correct chunk's raw similarity rank down near ~30, so
-    # the pool needs to be wide enough to still catch it.
-    candidate_pool_size = max(top_k * 10, 50)
 
     seen_chunks: set[tuple] = set()
     candidates: list[dict] = []
     for kb in target_kbs:
-        # PDF, DOCX, and Markdown all use the same hybrid strategy:
-        # dense + BM25 fused by Reciprocal Rank Fusion, then re-scored
-        # by a cross-encoder (see app.retrieval.hybrid_retriever). It
-        # replaces the whole per-route dense fan-out for these KBs -
-        # the hybrid pipeline already fuses lexical + semantic signals
-        # in a way that subsumes what the route-based content_type
-        # filter would add here. Other KBs (github, web) still use the
-        # per-route dense loop below.
-        if kb in _HYBRID_KBS:
-            where = _build_where(repository, None)
-            for hit in retrieve_hybrid(
-                query_text, query_vector, kb=kb, top_k=top_k, where=where
-            ):
+        # GitHub gets the SAME adaptive per-query-intent dispatch
+        # (explanation/exact_code/navigational/history/structural/
+        # general - see app.retrieval.github_adaptive) here as when a
+        # chat is explicitly scoped to just the GitHub KB
+        # (cli.py._prepare_context_and_images's kb=="github" branch
+        # calls the same function directly). Before this, a cross-KB
+        # question that happened to route to "github" only ever got
+        # the generic hybrid strategy below (github is also a member
+        # of _HYBRID_KBS) - meaning GraphRAG/exact-symbol-lookup/commit
+        # history could never fire outside a GitHub-scoped chat, even
+        # when routing correctly identified GitHub as relevant.
+        if kb == "github":
+            github_hits, _ = retrieve_github_adaptive(
+                query_text, top_k=top_k, repository=repository,
+                query_transform_enabled=query_transform_enabled,
+            )
+            for hit in github_hits:
                 document_id = hit["metadata"].get("document_id")
                 if document_id is not None:
                     dedup_key = (document_id, hit["metadata"].get("chunk_index"))
@@ -401,26 +390,67 @@ def retrieve(
                 candidates.append(hit)
             continue
 
-        for route in decision.routes:
-            content_types = _ROUTE_CONTENT_TYPES.get(route)
-            if route != "general" and content_types is None:
-                continue  # e.g. "image" - not a text-collection route, retrieve_images() handles it
-            restricted_to_kb = _ROUTE_CONTENT_TYPE_KB_RESTRICTION.get(route)
-            if restricted_to_kb is not None and restricted_to_kb != kb:
-                continue  # e.g. "code" content_type only ever exists in the "github" KB
-            where = _build_where(repository, content_types)
-            for hit in query_embedding(query_vector, top_k=candidate_pool_size, where=where, kb=kb):
+        # PDF, DOCX, Markdown, and Web all use the same hybrid
+        # strategy: dense + BM25 fused by Reciprocal Rank Fusion, then
+        # re-scored by a cross-encoder (see
+        # app.retrieval.hybrid_retriever).
+        if kb in _HYBRID_KBS:
+            where = _build_where(repository, None)
+            # Query transformation (see app.retrieval.query_transform):
+            # when enabled, produces a rewritten query, paraphrases,
+            # sub-questions, a HyDE answer paragraph, and topical
+            # keywords. Each variant contributes its own ranked list
+            # to the hybrid retriever's RRF fusion, widening the pool
+            # of candidates that make it to cross-encoder rerank. When
+            # disabled or the query is trivial, transform_query returns
+            # a no-op result and this branch behaves exactly like
+            # before. Cross-encoder scoring stays on the ORIGINAL text
+            # so ranking never drifts from the user's actual question.
+            transform = transform_query(query_text, kb=kb, enabled=query_transform_enabled)
+            for hit in retrieve_hybrid(
+                query_text, query_vector, kb=kb, top_k=top_k, where=where,
+                variants=transform.variants,
+                hyde_answer=transform.hyde_answer,
+                keywords=transform.keywords,
+            ):
                 document_id = hit["metadata"].get("document_id")
-                # Only dedup when document_id is actually present - chunks
-                # missing it (e.g. some synthetic/legacy metadata) would
-                # otherwise all collapse onto the same (None, None) key and
-                # wrongly get dropped as "duplicates" of one another.
                 if document_id is not None:
                     dedup_key = (document_id, hit["metadata"].get("chunk_index"))
                     if dedup_key in seen_chunks:
                         continue
                     seen_chunks.add(dedup_key)
                 candidates.append(hit)
+
+            # "table" route (see _ROUTE_CONTENT_TYPES, app.routing.router):
+            # an ADDITIONAL content_type-scoped hybrid pass, on top of
+            # (never instead of) the unscoped pass above - a query that
+            # explicitly signals "I'm asking about a table" (score >=
+            # 0.55) gets a dedicated table-only retriever alongside the
+            # general one, matching this module's documented "a route
+            # can only ADD candidates, never remove" contract. This was
+            # previously dead code: it lived in a per-route dense-only
+            # loop below that every KB already skipped (every KB name
+            # is a member of _HYBRID_KBS, so the "continue" above always
+            # fired first) - meaning a query that clearly asked about a
+            # table never got the targeted retrieval pass meant to boost
+            # it, only whatever the unscoped search happened to rank
+            # highly.
+            if "table" in decision.routes:
+                table_where = _build_where(repository, _ROUTE_CONTENT_TYPES["table"])
+                for hit in retrieve_hybrid(
+                    query_text, query_vector, kb=kb, top_k=top_k, where=table_where,
+                    variants=transform.variants,
+                    hyde_answer=transform.hyde_answer,
+                    keywords=transform.keywords,
+                ):
+                    document_id = hit["metadata"].get("document_id")
+                    if document_id is not None:
+                        dedup_key = (document_id, hit["metadata"].get("chunk_index"))
+                        if dedup_key in seen_chunks:
+                            continue
+                        seen_chunks.add(dedup_key)
+                    candidates.append(hit)
+            continue
 
     hits = _rerank_by_title_overlap(query_text, candidates, top_k)
     hits = _complete_partial_tables(hits)
@@ -491,7 +521,7 @@ def _rerank_images_by_alt_text_overlap(query_text: str, hits: list[dict], top_k:
     return [hit for _, hit in scored[:top_k]]
 
 
-def retrieve_images(query_text: str, top_k: int = 3) -> list[dict]:
+def retrieve_images(query_text: str, top_k: int = 3, kb: str | None = None) -> list[dict]:
     """
     Find the top_k stored images most relevant to a user's question,
     using the multimodal CLIP model (app.embeddings.image_embedder)
@@ -507,6 +537,17 @@ def retrieve_images(query_text: str, top_k: int = 3) -> list[dict]:
     Args:
         query_text: The user's natural-language question.
         top_k: How many images to retrieve.
+        kb: Optional KB scope ("web" or "video" - the only two
+            source_kb values images ever have). None (cross-KB chat)
+            searches every stored image regardless of origin, matching
+            the same "no explicit KB signal = search everything"
+            behavior retrieve() itself uses. When given, filters to
+            just that KB's images BEFORE similarity search - without
+            this, a question asked in one video's per-KB chat tab
+            could surface an unrelated web screenshot or a frame from
+            a completely different ingested video, since this
+            collection is shared across every image source (see
+            app.vectorstore.store's module docstring).
 
     Returns:
         A list of dicts, each with "content" (the image's alt text),
@@ -514,8 +555,9 @@ def retrieve_images(query_text: str, top_k: int = 3) -> list[dict]:
         "distance", and "similarity", ordered from most to least
         similar. Empty list if no images have been ingested yet.
     """
-    logger.info("Retrieving top_k=%d image(s) for query: %r", top_k, query_text)
+    logger.info("Retrieving top_k=%d image(s) for query: %r (kb=%r)", top_k, query_text, kb)
     query_vector = embed_text_for_image_search(query_text)
+    where = {"source_kb": kb} if kb else None
     # Same wider-candidate-pool + lexical-boost-rerank fix as retrieve()
     # above, applied to images (see _rerank_images_by_alt_text_overlap).
     # Needs a much wider pool than the text version's 50: most of this
@@ -531,8 +573,52 @@ def retrieve_images(query_text: str, top_k: int = 3) -> list[dict]:
     # let the lexical-overlap rerank below sort out relevance; this
     # sidesteps having to guess a pool size that works for every
     # possible query phrasing.
-    candidates = query_image_embedding(query_vector, top_k=_ALL_IMAGES_POOL_SIZE)
+    candidates = query_image_embedding(query_vector, top_k=_ALL_IMAGES_POOL_SIZE, where=where)
     return _rerank_images_by_alt_text_overlap(query_text, candidates, top_k)
+
+
+def retrieve_audio_clips(query_text: str, top_k: int = 3, kb: str | None = None) -> list[dict]:
+    """
+    Find the top_k stored audio clips most relevant to a user's
+    question, using CLAP (app.embeddings.audio_embedder) rather than
+    the text-only all-MiniLM-L6-v2 model or the CLIP image model -
+    CLAP is what makes matching a text query against ACOUSTIC
+    embeddings possible at all (see that module's docstring).
+
+    Always an ADDITIONAL, parallel lookup alongside retrieve() -
+    never a replacement for it. Unlike retrieve_images(), this does
+    NOT fetch the whole collection + lexically rerank - that treatment
+    exists to fix a specific, already-measured web-screenshot near-
+    duplicate problem in THIS corpus; there's no evidence yet audio
+    clips have the same failure mode, so plain top-k CLAP similarity
+    is the starting point until real usage says otherwise.
+
+    Args:
+        query_text: The user's natural-language question.
+        top_k: How many clips to retrieve.
+        kb: Optional KB scope ("audio" or "video" - the only two
+            source_kb values a clip ever has, see
+            app.ingestion.ingest._ingest_audio_clips). None (cross-KB
+            chat) searches every stored clip regardless of which file
+            it came from. When given, filters to just that KB's clips
+            BEFORE similarity search - without this, a question asked
+            about one specific video could surface an unrelated clip
+            from a completely different ingested audio/video file,
+            since this collection has no other notion of "which KB" a
+            clip belongs to.
+
+    Returns:
+        A list of dicts, each with "content" (a short label),
+        "metadata" (document_id, start_seconds, end_seconds,
+        source_audio_url), "distance", and "similarity", ordered from
+        most to least similar. Empty list if no audio clips have been
+        ingested yet (e.g. ENABLE_AUDIO_SIMILARITY_SEARCH was never
+        turned on).
+    """
+    logger.info("Retrieving top_k=%d audio clip(s) for query: %r (kb=%r)", top_k, query_text, kb)
+    query_vector = embed_text_for_audio_search(query_text)
+    where = {"source_kb": kb} if kb else None
+    return query_audio_clip_embedding(query_vector, top_k=top_k, where=where)
 
 
 if __name__ == "__main__":

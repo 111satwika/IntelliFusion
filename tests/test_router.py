@@ -5,9 +5,31 @@ the real sentence-transformers model (no store/network dependency, but
 not free either) - these tests accept that one-time model load cost
 rather than faking it out, since the whole point of this module is the
 actual embedding-similarity behavior, not just wiring.
+
+KB semantic scoring is corpus-derived (see module docstring), so it
+DOES touch app.vectorstore.store - most tests below still exercise it
+against the real (possibly empty, possibly populated) project store,
+same as before, but a few isolate the scoring logic itself by
+monkeypatching sample_kb_embeddings with controlled vectors, so those
+specific assertions don't depend on what happens to be ingested.
 """
 
+import pytest
+
+from app.routing import router
 from app.routing.router import RouteDecision, classify_route
+
+
+@pytest.fixture(autouse=True)
+def _reset_kb_routing_cache():
+    """Every test that monkeypatches sample_kb_embeddings must not leak
+    its fake samples into a later test - clear the cache before AND
+    after, so a failed assertion mid-test still leaves things clean
+    (unlike a manual cleanup call at the end of the test body, which a
+    raised AssertionError would skip)."""
+    router._kb_sample_embeddings_cache = None
+    yield
+    router._kb_sample_embeddings_cache = None
 
 
 def test_rule_based_keyword_routes_to_code():
@@ -29,6 +51,22 @@ def test_rule_based_keyword_routes_to_image():
 
     assert "image" in decision.routes
     assert "general" in decision.routes
+
+
+def test_rule_based_keyword_routes_to_sound():
+    decision = classify_route("find a recording that sounds like a car engine")
+
+    assert "sound" in decision.routes
+    assert "general" in decision.routes
+
+
+def test_semantic_routing_catches_a_sound_paraphrase_without_keywords():
+    # No literal "sounds like"/"audio clip" keyword here, but this is
+    # semantically an acoustic-similarity question.
+    decision = classify_route("is there a clip with laughter in it")
+
+    assert decision.method in {"semantic", "rule+semantic"}
+    assert "sound" in decision.routes or decision.scores["sound"] > 0.0
 
 
 def test_unmatched_query_falls_back_to_general_only():
@@ -56,10 +94,19 @@ def test_route_decision_equality_and_repr():
     assert "general" in repr(a)
 
 
-def test_no_kb_signal_leaves_kbs_empty():
+def test_no_kb_signal_leaves_kbs_empty(monkeypatch):
     # No explicit source mentioned at all - kbs should be empty,
     # leaving the "which KB(s) to search" decision to the caller (see
     # app.retrieval.retriever, which falls back to every populated KB).
+    # Mocked out (unlike most tests in this file - see module
+    # docstring) because this assertion is a strict "no KB scored
+    # above threshold": against the REAL corpus, "hello there" could
+    # occasionally draw a random sample that happens to score >= the
+    # threshold purely by chance, making this specific test flaky in a
+    # way the softer "in decision.routes"-style assertions elsewhere in
+    # this file are not.
+    monkeypatch.setattr(router, "sample_kb_embeddings", lambda kb, limit=40: [])
+
     decision = classify_route("hello there")
 
     assert decision.kbs == []
@@ -87,4 +134,77 @@ def test_rule_based_keyword_routes_to_the_web_kb():
     decision = classify_route("what does the documentation site say about setup")
 
     assert "web" in decision.kbs
+
+
+def test_rule_based_keyword_routes_to_the_audio_kb():
+    decision = classify_route("what does the podcast say about pricing")
+
+    assert "audio" in decision.kbs
+
+
+def test_rule_based_keyword_routes_to_the_video_kb():
+    decision = classify_route("what does the screen recording show about setup")
+
+    assert "video" in decision.kbs
+
+
+def test_semantic_kb_scoring_uses_corpus_samples_not_hardcoded_exemplars(monkeypatch):
+    # A query vector identical to one of "web"'s sampled chunk vectors
+    # should score a perfect 1.0 for "web" and 0.0 for every KB with no
+    # sample at all - proving the score comes from the injected sample,
+    # not any hand-written exemplar text.
+    def fake_sample(kb, limit=40):
+        if kb == "web":
+            return [[1.0, 0.0], [0.0, 1.0]]
+        return []
+
+    monkeypatch.setattr(router, "sample_kb_embeddings", fake_sample)
+
+    scores = router._semantic_kbs([1.0, 0.0])
+
+    assert scores["web"] == 1.0
+    assert scores["markdown"] == 0.0
+    assert scores["pdf"] == 0.0
+
+
+def test_semantic_kb_scoring_caches_samples_across_calls(monkeypatch):
+    calls = []
+
+    def fake_sample(kb, limit=40):
+        calls.append(kb)
+        return [[1.0, 0.0]]
+
+    monkeypatch.setattr(router, "sample_kb_embeddings", fake_sample)
+
+    router._semantic_kbs([1.0, 0.0])
+    first_call_count = len(calls)
+    router._semantic_kbs([0.0, 1.0])
+
+    assert len(calls) == first_call_count  # second call was served from cache, no re-sampling
+
+
+def test_invalidate_kb_routing_cache_forces_resample(monkeypatch):
+    calls = []
+
+    def fake_sample(kb, limit=40):
+        calls.append(kb)
+        return [[1.0, 0.0]]
+
+    monkeypatch.setattr(router, "sample_kb_embeddings", fake_sample)
+
+    router._semantic_kbs([1.0, 0.0])
+    router.invalidate_kb_routing_cache("web")
+    router._semantic_kbs([1.0, 0.0])
+
+    # Every KB got re-sampled after invalidation (invalidate always
+    # clears the whole cache - see its own docstring for why).
+    assert calls.count("web") == 2
+
+
+def test_semantic_kb_scoring_treats_empty_sample_as_zero_score(monkeypatch):
+    monkeypatch.setattr(router, "sample_kb_embeddings", lambda kb, limit=40: [])
+
+    scores = router._semantic_kbs([1.0, 0.0])
+
+    assert all(score == 0.0 for score in scores.values())
 

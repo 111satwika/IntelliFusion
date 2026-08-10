@@ -86,6 +86,42 @@ Design:
   by explicitly telling the model to reproduce the ENTIRE code
   block/array exactly as it appears, not just the part that most
   directly answers the question.
+- False-hedge on a sparse-but-complete result set: asking "what are the
+  latest pull requests and issues" against a repo that genuinely has
+  only one open PR and zero issues retrieved exactly that one PR chunk
+  (retrieval was correct - see app.routing.github_intent's "activity"
+  intent), but the model answered "I don't have enough information...
+  does not contain details about OTHER pull requests or issues" - it
+  read "only one item shown" as "incomplete", when for a repo with
+  exactly one open PR, one item IS the complete answer. The grounding
+  instructions already tell it not to use outside knowledge, which
+  apparently reads as "don't trust what's in front of you either" once
+  the question implies a whole category (issues/PRs/features/...) and
+  the context only contains a single instance of that category. A
+  first fix attempt - one added sentence, abstractly worded ("state
+  those items directly... do not hedge by saying you lack information
+  about OTHER items") - did NOT work; retesting produced the same
+  refusal shape verbatim. A second, more forceful version (explicit
+  MUST/MUST NOT language, still abstract) also did not move it. What
+  finally worked was a full worked example inline in the instructions:
+  a concrete sample question, a concrete one-item context, the exact
+  CORRECT answer shape, and the exact WRONG answer shape labeled as
+  wrong - i.e. the same lesson this file already learned from the
+  code-verbatim fix above (small local models respond to a specific
+  pattern to match, not an abstract rule to reason from) applied to a
+  refusal-shape problem instead of a completeness problem.
+- Conversation memory: an optional `history` param (recent question/
+  answer turns from the same chat thread - see session_store.py,
+  app.retrieval.contextualize) is rendered as its own bounded
+  "Conversation so far:" block, separate from the retrieved-context
+  budget (its own max_history_tokens), so the model can keep pronouns/
+  corrections/tone coherent across turns even when retrieval alone
+  already found the right chunks. `query_text` on the final "Question:"
+  line is always the user's ORIGINAL wording, never the contextualized/
+  rewritten standalone form app.retrieval.contextualize produces for
+  RETRIEVAL - the model resolves references itself from the history
+  block shown immediately above, so "Question:" always matches what
+  the user actually typed.
 """
 
 import logging
@@ -95,7 +131,7 @@ logger = logging.getLogger(__name__)
 _tiktoken_encoder = None
 _tiktoken_checked = False
 
-_SYSTEM_INSTRUCTIONS = """Answer the question using only the context provided below. Not every passage will be relevant - ignore any that don't help answer the question. When more than one passage IS relevant, combine the details from ALL of them into one complete answer - do not stop at the first, shortest, or most obviously matching passage if another relevant passage adds more detail. If any relevant passage contains code (JSON, JavaScript, or any other code block), reproduce that ENTIRE code block verbatim in a fenced code block as part of your answer, exactly as it appears in the context - do not paraphrase it, and do not reproduce only the part (e.g. only one element of a JSON array, such as just the action) that seems most relevant while dropping the other elements (such as trigger or filter/condition blocks); the code is only correct and usable if every part of it is included together, unchanged. If any relevant passage contains a Markdown pipe table (lines that start and end with "|" and have a "| --- | --- |" separator row), reproduce that ENTIRE table verbatim in your answer using the same Markdown pipe syntax - do not convert it into bullet points, numbered lists, prose, or a summary; the table's rows/columns are the answer, and the reader relies on the same tabular layout being preserved. Do not use outside knowledge or make assumptions beyond what is given in the context. If the context truly contains nothing related to the question, say you don't have enough information to answer it. When useful, mention which section(s) you used."""
+_SYSTEM_INSTRUCTIONS = """Answer the question using only the context provided below. Not every passage will be relevant - ignore any that don't help answer the question. When more than one passage IS relevant, combine the details from ALL of them into one complete answer - do not stop at the first, shortest, or most obviously matching passage if another relevant passage adds more detail. If any relevant passage contains code (JSON, JavaScript, or any other code block), reproduce that ENTIRE code block verbatim in a fenced code block as part of your answer, exactly as it appears in the context - do not paraphrase it, and do not reproduce only the part (e.g. only one element of a JSON array, such as just the action) that seems most relevant while dropping the other elements (such as trigger or filter/condition blocks); the code is only correct and usable if every part of it is included together, unchanged. If any relevant passage contains a Markdown pipe table (lines that start and end with "|" and have a "| --- | --- |" separator row), reproduce that ENTIRE table verbatim in your answer using the same Markdown pipe syntax - do not convert it into bullet points, numbered lists, prose, or a summary; the table's rows/columns are the answer, and the reader relies on the same tabular layout being preserved. Do not use outside knowledge or make assumptions beyond what is given in the context. If the question asks you to list, count, or summarize a set of items (such as issues, pull requests, features, or endpoints), treat every matching item that appears anywhere in the context as the complete answer, EVEN IF that is only a single item - the context is the result of a search for exactly this kind of item, so if it surfaced one, that one IS the current answer. Worked example: the question is "what are the latest pull requests and issues", and the context contains one passage describing an open pull request titled "Fix login bug". The CORRECT answer is: "There is one open pull request: Fix login bug — <details from the context>. No issues are shown in the available context." The WRONG answer - do not produce anything shaped like this - is: "I don't have enough information. The context does not contain details about other pull requests or issues." That wrong answer is wrong because the question never required knowledge of items beyond what the context shows; only fall back to "I don't have enough information" when NOT EVEN ONE matching item appears anywhere in the context. When useful, mention which section(s) you used."""
 
 
 def _count_tokens(text: str) -> int:
@@ -188,6 +224,28 @@ def _build_context_note(retrieved_chunks: list[dict]) -> str:
     return " ".join(notes)
 
 
+def _format_history(history: list[dict], max_history_tokens: int) -> str:
+    """
+    Render recent conversation turns as "Q: ...\\nA: ..." blocks,
+    chronological order, trimmed to a separate token sub-budget from
+    the retrieved-context block - oldest turns dropped first since the
+    most recent turn is almost always the one a follow-up depends on.
+    """
+    kept: list[str] = []
+    used_tokens = 0
+    # Walk newest-first so trimming drops the OLDEST turns, then
+    # reverse back to chronological order for rendering.
+    for turn in reversed(history):
+        block = f"Q: {turn.get('question', '')}\nA: {turn.get('answer', '')}"
+        block_tokens = _count_tokens(block)
+        if kept and used_tokens + block_tokens > max_history_tokens:
+            break
+        kept.append(block)
+        used_tokens += block_tokens
+    kept.reverse()
+    return "\n\n".join(kept)
+
+
 def _format_chunk(index: int, chunk: dict) -> str:
     """Format a single retrieved chunk into a labeled context block."""
     metadata = chunk["metadata"]
@@ -217,23 +275,37 @@ def build_prompt(
     query_text: str,
     retrieved_chunks: list[dict],
     max_context_tokens: int = 3000,
+    history: list[dict] | None = None,
+    max_history_tokens: int = 800,
 ) -> str:
     """
     Build a single grounded prompt string from a user question and the
     chunks retrieved for it.
 
     Args:
-        query_text: The user's natural-language question.
+        query_text: The user's natural-language question, exactly as
+            typed - even when retrieval ran against a contextualized/
+            rewritten standalone form (see app.retrieval.contextualize),
+            this is always the ORIGINAL wording, so "Question:" always
+            matches what the user actually asked.
         retrieved_chunks: Chunks from app.retrieval.retriever.retrieve,
             ordered from most to least similar.
         max_context_tokens: Maximum token budget for the context block.
             Chunks are added in order (most similar first) until adding
             the next one would exceed this budget; remaining chunks are
             dropped rather than truncated mid-text.
+        history: Optional recent question/answer turns from the same
+            chat thread (see session_store.get_history), oldest first.
+            None/empty renders no conversation block at all - fully
+            backward compatible with every existing caller.
+        max_history_tokens: Separate token budget for the history block
+            (independent of max_context_tokens) - oldest turns dropped
+            first when it doesn't fit.
 
     Returns:
-        A single prompt string: system instructions + context block +
-        the user's question, ready to send to an LLM.
+        A single prompt string: system instructions + (optional)
+        conversation history + context block + the user's question,
+        ready to send to an LLM.
     """
     context_blocks: list[str] = []
     used_tokens = 0
@@ -259,9 +331,16 @@ def build_prompt(
         used_tokens,
     )
 
+    history_block = ""
+    if history:
+        history_text = _format_history(history, max_history_tokens)
+        if history_text:
+            history_block = f"Conversation so far:\n{history_text}\n\n"
+
     return (
         f"{_SYSTEM_INSTRUCTIONS}\n\n"
         f"{_build_context_note(retrieved_chunks)}\n\n"
+        f"{history_block}"
         f"Context:\n{context_text}\n\n"
         f"Question: {query_text}\n\n"
         f"Answer:"

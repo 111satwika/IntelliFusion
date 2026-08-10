@@ -108,6 +108,8 @@ import requests
 from bs4 import BeautifulSoup
 from docx.table import Table as DocxTable
 
+from app.ocr.frame_analysis import analyze_frame
+
 logger = logging.getLogger(__name__)
 
 # Invisible marker inserted at the start of each PDF page's text (see
@@ -433,6 +435,371 @@ def load_docx_document(file_path: str) -> Document:
     }
 
     logger.info("Loaded DOCX '%s' (%d characters)", path.name, len(content))
+    return Document(content=content, metadata=metadata)
+
+
+# ---------------------------------------------------------------------
+# Audio / video ingestion
+#
+# Transcription uses faster-whisper (a CTranslate2 reimplementation of
+# OpenAI's Whisper - much faster than the original PyTorch model on
+# CPU, matching this project's "everything runs locally, no billed
+# calls" design already used by embedder.py/image_embedder.py/OCR).
+# faster-whisper decodes audio via PyAV, which bundles its own FFmpeg
+# shared libraries in the pip wheel - verified live against real
+# WAV/MP4 files on a machine with no system ffmpeg on PATH, so unlike
+# Playwright's browser binary this needs no separate install step for
+# standard mp3/wav/mp4/m4a files. An unusual codec PyAV's bundled libs
+# don't cover would still need a system ffmpeg install, same as
+# Playwright's "playwright install chromium" - not expected for
+# typical recordings, not guaranteed for every possible file.
+#
+# The transcription call is isolated behind _transcribe_audio() and the
+# model behind _get_whisper_model() specifically so tests can
+# monkeypatch the call/model without ever loading the real model - same
+# convention as app.ocr.image_ocr's _get_reader()/EasyOCR.
+# ---------------------------------------------------------------------
+
+# First "value" (not boolean) environment variable in this codebase -
+# every existing one (e.g. SEMANTIC_ANSWER_CACHE_ENABLED) is a "1"/""
+# toggle; this one is a faster-whisper model-size string (tiny/base/
+# small/medium/large-v2/large-v3/...). Read at import time, matching
+# the one existing env-var precedent's timing even though the value
+# shape is new.
+_WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
+
+# Video frame sampling defaults (see load_video_document). Chosen so a
+# typical screen-recording/tutorial video (where a slide or code view
+# holds for 10-60+ seconds) gets caught by a 10s interval, while
+# max_frames bounds the worst case for a long video - widening the
+# effective interval for anything longer than 10 minutes rather than
+# truncating the video's back half (see load_video_document).
+_DEFAULT_FRAME_INTERVAL_SECONDS = 10
+_DEFAULT_MAX_FRAMES = 60
+
+# CLAP audio-clip sampling defaults (see _sample_audio_clips,
+# app.embeddings.audio_embedder) - 10s matches CLAP's native/trained
+# window length, non-overlapping by default. Same "widen the effective
+# hop for a long file rather than truncate" strategy as video frames.
+_DEFAULT_CLAP_WINDOW_SECONDS = 10
+_DEFAULT_MAX_AUDIO_CLIPS = 60
+
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Lazily create the faster-whisper model, so importing this
+    module is cheap and the (one-time, ~100MB for "base") model
+    download only happens when transcription is actually attempted."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+
+        logger.info("Loading local Whisper model (size=%s)...", _WHISPER_MODEL_SIZE)
+        _whisper_model = WhisperModel(_WHISPER_MODEL_SIZE)
+        logger.info("Whisper model loaded.")
+    return _whisper_model
+
+
+def _transcribe_audio(file_path: str) -> tuple[list, float]:
+    """
+    Transcribe file_path's audio track into (segments, duration_seconds).
+
+    segments is a list of faster-whisper Segment objects (each with
+    .start/.end/.text), or [] if the file has no audio stream at all
+    (e.g. a silent/muted video - PyAV raises an IndexError trying to
+    select a nonexistent audio stream rather than returning an empty
+    result, so that specific failure is treated as "no transcript"
+    instead of propagating) or if nothing was found to transcribe.
+
+    duration_seconds is the audio track's REAL duration reported by
+    faster-whisper (info.duration) - deliberately not derived from the
+    last segment's end time, since a video/audio file with real
+    duration but no detected speech (e.g. a silent screen-recording
+    with narration-free stretches VAD filtered entirely) would
+    otherwise misleadingly report 0.0.
+
+    vad_filter=True (faster-whisper's built-in voice-activity
+    detection) skips silence - both faster and reduces the small-model
+    failure mode of hallucinating text over silent stretches.
+    """
+    model = _get_whisper_model()
+    try:
+        segments, info = model.transcribe(file_path, vad_filter=True)
+        return list(segments), info.duration
+    except IndexError:
+        logger.info("No audio stream found in '%s' - no transcript to extract.", file_path)
+        return [], 0.0
+
+
+def _format_timestamp(seconds: float) -> str:
+    """"MM:SS" for content under an hour, "HH:MM:SS" for longer."""
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def load_audio_document(file_path: str) -> Document:
+    """
+    Transcribe a single audio file from disk and return it as ONE
+    Document, one line per Whisper segment, each prefixed with an
+    inline human-readable timestamp (e.g. "[01:23] ..."). No
+    PDF-style page-marker mechanism is needed here - a transcript is
+    plain prose either way, so chunker.py packs it exactly like any
+    other unstructured text, and the timestamps stay readable/citable
+    by the LLM because they're literally part of the content, not
+    metadata chunker.py has to parse out.
+
+    Args:
+        file_path: Path to the audio file to load (mp3/wav/m4a/flac/
+            ogg or anything faster-whisper's bundled PyAV can decode).
+
+    Returns:
+        Document with the timestamped transcript as `content` (""
+        if the file has no audio stream at all), and metadata matching
+        the same shape used by every other loader (source_type,
+        file_name, file_path, document_id) plus duration_seconds.
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+    """
+    path = Path(file_path)
+
+    if not path.exists():
+        logger.error("Document not found: %s", file_path)
+        raise FileNotFoundError(f"Document not found: {file_path}")
+
+    segments, duration = _transcribe_audio(str(path))
+    content = "\n".join(f"[{_format_timestamp(seg.start)}] {seg.text.strip()}" for seg in segments)
+
+    metadata = {
+        "source_type": "audio",
+        "file_name": path.name,
+        "file_path": str(path),
+        "document_id": path.name,
+        "duration_seconds": duration,
+    }
+
+    logger.info("Transcribed audio '%s' (%d segment(s), %.1fs)", path.name, len(segments), duration)
+    return Document(content=content, metadata=metadata)
+
+
+def _video_duration_seconds(file_path: str) -> float:
+    """
+    The video's real length via OpenCV (frame_count / fps) - used
+    instead of the audio transcription's duration for
+    load_video_document's reported duration_seconds and frame-interval
+    math, since a video with no audio track (or long silent stretches
+    VAD filters entirely) would otherwise misleadingly report 0.0 or a
+    too-short duration despite having real, sampleable video length.
+    """
+    import cv2
+
+    capture = cv2.VideoCapture(file_path)
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+        frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+        return (frame_count / fps) if fps else 0.0
+    finally:
+        capture.release()
+
+
+def _sample_video_frames(file_path: str, interval_seconds: float, duration_seconds: float):
+    """
+    Yield (timestamp_seconds, PIL.Image) tuples sampled from a video at
+    a fixed interval via OpenCV (opencv-python-headless bundles its own
+    codecs, same self-containment reasoning as PyAV above - see module
+    docstring). A frame that fails to decode is silently skipped rather
+    than raising, matching this codebase's "one bad source can't break
+    everything else" pattern (e.g. app.embeddings.image_embedder's
+    download_image).
+    """
+    import cv2
+    from PIL import Image
+
+    capture = cv2.VideoCapture(file_path)
+    try:
+        timestamp = 0.0
+        while duration_seconds == 0.0 or timestamp <= duration_seconds:
+            capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+            ok, frame = capture.read()
+            if not ok:
+                break
+            try:
+                yield timestamp, Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            except Exception as error:  # noqa: BLE001 - one bad frame can't break the rest of sampling
+                logger.warning("Failed to decode a video frame at %.1fs (skipping): %s", timestamp, error)
+            timestamp += interval_seconds
+    finally:
+        capture.release()
+
+
+def _sample_audio_clips(
+    file_path: str,
+    window_seconds: float = _DEFAULT_CLAP_WINDOW_SECONDS,
+    max_clips: int = _DEFAULT_MAX_AUDIO_CLIPS,
+):
+    """
+    Yield (start_seconds, end_seconds, waveform: np.ndarray) tuples for
+    fixed-length, non-overlapping windows of file_path's audio track,
+    decoded+resampled once via PyAV to CLAP's required 48kHz mono
+    float32 format (see app.embeddings.audio_embedder), then sliced
+    in-memory - cheaper than one decoder invocation per window.
+
+    Mirrors _sample_video_frames's "widen the effective spacing for a
+    long file rather than truncate" strategy: hop = max(window_seconds,
+    duration / max_clips), so a long file gets sparser coverage across
+    its FULL length instead of only ever embedding its first N minutes.
+
+    Yields nothing (not an error) for a file with no audio stream at
+    all - mirrors _transcribe_audio's own handling of the same PyAV
+    IndexError case (e.g. a silent/muted video).
+    """
+    import av
+    import numpy as np
+
+    from app.embeddings.audio_embedder import CLAP_SAMPLE_RATE
+
+    try:
+        container = av.open(file_path)
+        stream = container.streams.audio[0]
+    except IndexError:
+        # Confirmed live (see loader.py's own _transcribe_audio) - a
+        # video/audio file with no audio stream at all raises this
+        # trying to select a nonexistent stream, rather than returning
+        # an empty result.
+        logger.info("No audio stream found in '%s' - nothing to sample for CLAP.", file_path)
+        return
+
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=CLAP_SAMPLE_RATE)
+    segments = []
+    for frame in container.decode(stream):
+        for resampled_frame in resampler.resample(frame):
+            segments.append(resampled_frame.to_ndarray())
+    container.close()
+
+    if not segments:
+        return
+
+    waveform = np.concatenate(segments, axis=1).flatten()
+    duration_seconds = len(waveform) / CLAP_SAMPLE_RATE
+
+    hop_seconds = window_seconds
+    if duration_seconds and max_clips:
+        hop_seconds = max(window_seconds, duration_seconds / max_clips)
+
+    start = 0.0
+    while start < duration_seconds:
+        end = min(start + window_seconds, duration_seconds)
+        start_sample = int(start * CLAP_SAMPLE_RATE)
+        end_sample = int(end * CLAP_SAMPLE_RATE)
+        window = waveform[start_sample:end_sample]
+        if len(window) > 0:
+            yield start, end, window
+        start += hop_seconds
+
+
+def load_video_document(
+    file_path: str,
+    frame_interval_seconds: int = _DEFAULT_FRAME_INTERVAL_SECONDS,
+    max_frames: int = _DEFAULT_MAX_FRAMES,
+) -> Document:
+    """
+    Transcribe a video's audio track (via the same Whisper path as
+    load_audio_document) AND sample frames at intervals, running each
+    through app.ocr.frame_analysis.analyze_frame() (the same OCR +
+    code-only-vision pipeline already used for website images), then
+    merge transcript lines and frame-text lines into ONE Document,
+    sorted by timestamp.
+
+    Interleaved into the SAME Document rather than stored as separate
+    chunks the way website image OCR/vision text is (see
+    app.ingestion.ingest._ingest_images): that pattern exists because a
+    website image is a distinct CLIP embedding space AND individually
+    addressable by its own URL independent of the page - neither
+    applies to a video frame (no CLIP embedding happens here, and a
+    frame has no stable id the way a web image's URL does). A frame
+    instead has a natural temporal position in the transcript, and
+    merging means a chunk containing both what was SAID and what was
+    ON SCREEN at that moment retrieves as one coherent unit - e.g.
+    "explain the code shown at 2:30" is answered better by one chunk
+    with both than by two independently-competing ones.
+
+    Frame sampling interval widens automatically for long videos
+    (`interval = max(frame_interval_seconds, duration / max_frames)`)
+    rather than truncating past max_frames - silently dropping a
+    video's back half would make questions about its ending
+    unanswerable, a worse failure mode than sparser sampling
+    throughout.
+
+    COST WARNING: each sampled frame runs cheap OCR, but a frame whose
+    OCR text looks like code additionally triggers a local vision-model
+    call (~10-60s on CPU, per app.ingestion.ingest's own docstring for
+    the same gate). A code-heavy tutorial video could have most of its
+    capped frames classified as code, making one video's ingestion take
+    30-60+ minutes in the worst case - pass a smaller max_frames for a
+    faster, less thorough ingest if that matters more than coverage.
+
+    Args:
+        file_path: Path to the video file to load (mp4/mov/mkv/avi/
+            webm or anything OpenCV's bundled codecs can decode).
+        frame_interval_seconds: Minimum seconds between sampled frames.
+        max_frames: Hard cap on frames sampled per video - the actual
+            interval widens automatically for videos where the default
+            interval would exceed this cap.
+
+    Returns:
+        Document with the merged transcript+frame-text content, and
+        metadata matching every other loader's shape (source_type,
+        file_name, file_path, document_id) plus duration_seconds and
+        frame_count_sampled.
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+    """
+    path = Path(file_path)
+
+    if not path.exists():
+        logger.error("Document not found: %s", file_path)
+        raise FileNotFoundError(f"Document not found: {file_path}")
+
+    segments, audio_duration = _transcribe_audio(str(path))
+    duration = max(audio_duration, _video_duration_seconds(str(path)))
+
+    lines: list[tuple[float, str]] = [
+        (seg.start, f"[{_format_timestamp(seg.start)}] {seg.text.strip()}") for seg in segments
+    ]
+
+    interval = frame_interval_seconds
+    if duration and max_frames:
+        interval = max(frame_interval_seconds, duration / max_frames)
+
+    frame_count = 0
+    for timestamp, frame in _sample_video_frames(str(path), interval, duration):
+        frame_count += 1
+        analysis = analyze_frame(frame)
+        if analysis.text:
+            lines.append((timestamp, f"[{_format_timestamp(timestamp)}] [Frame text: {analysis.text}]"))
+
+    lines.sort(key=lambda item: item[0])
+    content = "\n".join(text for _timestamp, text in lines)
+
+    metadata = {
+        "source_type": "video",
+        "file_name": path.name,
+        "file_path": str(path),
+        "document_id": path.name,
+        "duration_seconds": duration,
+        "frame_count_sampled": frame_count,
+    }
+
+    logger.info(
+        "Loaded video '%s' (%d transcript segment(s), %d frame(s) sampled, %.1fs)",
+        path.name, len(segments), frame_count, duration,
+    )
     return Document(content=content, metadata=metadata)
 
 
@@ -1116,11 +1483,26 @@ def _parse_github_repo_url(repo_url: str) -> tuple[str, str, str | None]:
         ValueError: if an owner/repo pair can't be parsed out.
     """
     text = repo_url.strip()
+    # Markdown link syntax "[label](target)" — VS Code and many chat
+    # UIs auto-linkify a pasted URL into this form, so unwrap it and
+    # keep the target. Preferred over the label because the label can
+    # be a shortened display string (e.g. "github.com/…").
+    md_link = re.match(r"^\[[^\]]*\]\((.+)\)$", text)
+    if md_link:
+        text = md_link.group(1).strip()
     text = re.sub(r"^https?://github\.com/", "", text)
     if text.endswith(".git"):
         text = text[: -len(".git")]
     parts = [part for part in text.strip("/").split("/") if part]
 
+    if len(parts) == 1:
+        # A single segment (e.g. "pytorch") is a user or org, not a
+        # repo — surface that explicitly so the user knows to add the
+        # repo name rather than assuming the URL was malformed.
+        raise ValueError(
+            f"{repo_url!r} looks like a GitHub user/org, not a repository. "
+            f"Please include the repository name, e.g. '{parts[0]}/<repo>'."
+        )
     if len(parts) < 2:
         raise ValueError(f"Could not parse a GitHub owner/repo from: {repo_url!r}")
 
@@ -1193,11 +1575,14 @@ def load_github_repository(
 
     Each returned Document's metadata includes: source_type="code",
     repository ("owner/repo"), branch, commit_hash (the tree's
-    resolved sha), file_path, file_name, language (see
-    _infer_language), and document_id ("owner/repo:path" - stable
-    across re-ingestion, so re-ingesting the same repo/branch upserts
-    the same chunks instead of duplicating them, exactly like every
-    other source's document_id).
+    resolved sha), file_path, file_name, file_dir (parent directory
+    of file_path, or "" for root files - lets
+    app.retrieval.github_adaptive filter by directory without needing
+    a Chroma $starts-with operator), language (see _infer_language),
+    and document_id ("owner/repo:path" - stable across re-ingestion,
+    so re-ingesting the same repo/branch upserts the same chunks
+    instead of duplicating them, exactly like every other source's
+    document_id).
 
     Args:
         repo_url: Any of the forms _parse_github_repo_url() accepts.
@@ -1275,6 +1660,14 @@ def load_github_repository(
             "commit_hash": commit_hash,
             "file_path": path,
             "file_name": Path(path).name,
+            # Parent directory of file_path, or "" for a file at the
+            # repo root. Stored explicitly so
+            # app.retrieval.github_adaptive can build a cheap $eq
+            # metadata filter for directory-scoped queries (e.g. "in
+            # app/retrieval/") - Chroma's where operators don't
+            # include $starts-with, so we can't derive this from
+            # file_path at query time.
+            "file_dir": str(Path(path).parent).replace("\\", "/") if Path(path).parent != Path(".") else "",
             "language": _infer_language(path),
             "document_id": f"{owner}/{repo}:{path}",
         }
@@ -1284,6 +1677,349 @@ def load_github_repository(
         "Loaded %d file(s) from GitHub repo %s/%s@%s",
         len(documents), owner, repo, branch,
     )
+    return documents
+
+
+# Cap on issues/PRs/discussions fetched per repo. Mirrors
+# _DEFAULT_MAX_FILES's reasoning: generous for a typical project's
+# actual activity while still bounding worst-case cost for a very
+# active repo with thousands of issues.
+_DEFAULT_MAX_ACTIVITY_ITEMS = 200
+
+# GitHub's REST list endpoints (issues, pulls) cap per_page at 100.
+_ACTIVITY_API_MAX_PER_PAGE = 100
+
+_GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+
+
+def _format_activity_content(title: str, number: int, state: str, body: str | None) -> str:
+    """
+    Shared content shape for issues/PRs/discussions: an H1 heading (so
+    chunker.py's existing heading-aware section grouping applies, same
+    convention as every other loader in this module) followed by the
+    body text. Kept deliberately compact - state and number are stored
+    as metadata (see the three load_github_* functions below) rather
+    than repeated in every chunk's text.
+    """
+    heading = f"# #{number}: {title}".strip()
+    body_text = (body or "").strip() or "(no description provided)"
+    return f"{heading}\n\nState: {state}\n\n{body_text}"
+
+
+def load_github_issues(
+    owner: str,
+    repo: str,
+    max_items: int = _DEFAULT_MAX_ACTIVITY_ITEMS,
+    timeout: int = 30,
+) -> list[Document]:
+    """
+    Load a repository's issues into one Document each, via GitHub's
+    REST Issues API (GET /repos/{owner}/{repo}/issues?state=all),
+    paginated (the endpoint caps at 100/page, and a repo can have far
+    more issues than that).
+
+    GitHub's issues endpoint also returns pull requests (a PR IS an
+    issue under the hood) - each returned object that's actually a PR
+    carries a "pull_request" key, which this function filters out so
+    load_github_pull_requests() is the only path that returns PRs
+    (avoiding storing the same item twice under two content_types).
+
+    Deliberately does NOT fetch each issue's comment thread (that
+    would cost one extra API call per issue, multiplying request
+    volume by the average thread length) - only the issue's own
+    title+body is stored. This keeps API cost proportional to issue
+    count, not issue*comment count; comment-thread ingestion can be
+    added later as an opt-in if it proves valuable.
+
+    Each Document's metadata matches load_github_repository()'s shape
+    where it makes sense (source_type="code" so it lands in the same
+    "github" KB - see app.vectorstore.store's _SOURCE_TYPE_TO_KB -
+    and gets the same parent-child chunk expansion; repository) plus
+    content_type="issue" to distinguish it from source-code chunks,
+    and document_id "owner/repo:issue:<number>" (stable across
+    re-ingestion, so re-ingesting the same repo upserts rather than
+    duplicates).
+
+    Args:
+        owner, repo: The repository to fetch issues for.
+        max_items: Cap on how many issues to return (by API order,
+            newest-updated first - GitHub's default sort). A warning
+            is logged if fetching stops because this cap was hit.
+        timeout: Per-request timeout in seconds.
+
+    Raises:
+        requests.exceptions.RequestException: if the API itself is
+            unreachable or returns an error - not caught here, same as
+            load_github_repository's tree-listing call.
+    """
+    headers = _github_headers()
+    documents: list[Document] = []
+    page = 1
+    while len(documents) < max_items:
+        response = requests.get(
+            f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/issues",
+            params={
+                "state": "all",
+                "per_page": _ACTIVITY_API_MAX_PER_PAGE,
+                "page": page,
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        batch = response.json()
+        if not batch:
+            break
+
+        for item in batch:
+            if "pull_request" in item:
+                continue  # a PR, handled by load_github_pull_requests instead
+            number = item["number"]
+            documents.append(
+                Document(
+                    content=_format_activity_content(
+                        item.get("title", ""), number, item.get("state", "unknown"), item.get("body")
+                    ),
+                    metadata={
+                        "source_type": "code",
+                        "repository": f"{owner}/{repo}",
+                        "content_type": "issue",
+                        "number": number,
+                        "state": item.get("state"),
+                        "author": (item.get("user") or {}).get("login"),
+                        "url": item.get("html_url"),
+                        "file_name": f"Issue #{number}: {item.get('title', '')}",
+                        "document_id": f"{owner}/{repo}:issue:{number}",
+                    },
+                )
+            )
+            if len(documents) >= max_items:
+                break
+
+        if len(batch) < _ACTIVITY_API_MAX_PER_PAGE:
+            break
+        page += 1
+
+    if len(documents) >= max_items:
+        logger.warning(
+            "GitHub repo %s/%s has more issues than max_items=%d; only the first %d "
+            "(newest-updated first) were loaded. Pass a higher max_items to load more.",
+            owner, repo, max_items, len(documents),
+        )
+
+    logger.info("Loaded %d issue(s) from GitHub repo %s/%s", len(documents), owner, repo)
+    return documents
+
+
+def load_github_pull_requests(
+    owner: str,
+    repo: str,
+    max_items: int = _DEFAULT_MAX_ACTIVITY_ITEMS,
+    timeout: int = 30,
+) -> list[Document]:
+    """
+    Load a repository's pull requests into one Document each, via
+    GitHub's REST Pulls API (GET /repos/{owner}/{repo}/pulls?state=all),
+    paginated the same way as load_github_issues().
+
+    Same content/comment-thread scope decision as load_github_issues()
+    (title+body only, no per-PR comment fetch). Metadata matches
+    load_github_issues()'s shape with content_type="pull_request" and
+    document_id "owner/repo:pr:<number>".
+
+    Args:
+        owner, repo: The repository to fetch pull requests for.
+        max_items: Cap on how many PRs to return (by API order,
+            newest-updated first).
+        timeout: Per-request timeout in seconds.
+
+    Raises:
+        requests.exceptions.RequestException: if the API itself is
+            unreachable or returns an error.
+    """
+    headers = _github_headers()
+    documents: list[Document] = []
+    page = 1
+    while len(documents) < max_items:
+        response = requests.get(
+            f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/pulls",
+            params={
+                "state": "all",
+                "per_page": _ACTIVITY_API_MAX_PER_PAGE,
+                "page": page,
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        batch = response.json()
+        if not batch:
+            break
+
+        for item in batch:
+            number = item["number"]
+            documents.append(
+                Document(
+                    content=_format_activity_content(
+                        item.get("title", ""), number, item.get("state", "unknown"), item.get("body")
+                    ),
+                    metadata={
+                        "source_type": "code",
+                        "repository": f"{owner}/{repo}",
+                        "content_type": "pull_request",
+                        "number": number,
+                        "state": item.get("state"),
+                        "author": (item.get("user") or {}).get("login"),
+                        "url": item.get("html_url"),
+                        "file_name": f"PR #{number}: {item.get('title', '')}",
+                        "document_id": f"{owner}/{repo}:pr:{number}",
+                    },
+                )
+            )
+            if len(documents) >= max_items:
+                break
+
+        if len(batch) < _ACTIVITY_API_MAX_PER_PAGE:
+            break
+        page += 1
+
+    if len(documents) >= max_items:
+        logger.warning(
+            "GitHub repo %s/%s has more pull requests than max_items=%d; only the first %d "
+            "(newest-updated first) were loaded. Pass a higher max_items to load more.",
+            owner, repo, max_items, len(documents),
+        )
+
+    logger.info("Loaded %d pull request(s) from GitHub repo %s/%s", len(documents), owner, repo)
+    return documents
+
+
+_DISCUSSIONS_GRAPHQL_QUERY = """
+query($owner: String!, $repo: String!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    discussions(first: 50, after: $after, orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        body
+        url
+        author { login }
+        category { name }
+      }
+    }
+  }
+}
+"""
+
+
+def load_github_discussions(
+    owner: str,
+    repo: str,
+    max_items: int = _DEFAULT_MAX_ACTIVITY_ITEMS,
+    timeout: int = 30,
+) -> list[Document]:
+    """
+    Load a repository's Discussions into one Document each, via
+    GitHub's GraphQL API - unlike issues/PRs, Discussions have no REST
+    endpoint at all, so this is the one loader in this module that
+    talks GraphQL instead of REST.
+
+    Requires GITHUB_TOKEN to be set: GitHub's GraphQL API rejects even
+    read-only queries against public repos with no auth at all (unlike
+    REST, which allows a reduced-rate anonymous allowance) - so this
+    raises a clear, specific error up front rather than letting an
+    anonymous request fail deep inside pagination with a cryptic 401.
+
+    Same content/comment-thread scope decision as load_github_issues()
+    (title+body only - a discussion's replies are a separate, nested
+    GraphQL connection that would need its own pagination per
+    discussion). Metadata matches the issues/PRs shape with
+    content_type="discussion" and document_id
+    "owner/repo:discussion:<number>".
+
+    Args:
+        owner, repo: The repository to fetch discussions for.
+        max_items: Cap on how many discussions to return (by API
+            order, newest-created first).
+        timeout: Per-request timeout in seconds.
+
+    Raises:
+        RuntimeError: if GITHUB_TOKEN is not set.
+        requests.exceptions.RequestException: if the API itself is
+            unreachable or returns an HTTP-level error.
+        ValueError: if the GraphQL response itself reports errors
+            (e.g. Discussions not enabled for this repository).
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Loading GitHub Discussions requires a GITHUB_TOKEN environment variable - "
+            "GitHub's GraphQL API does not allow unauthenticated requests, even for public "
+            "repos and read-only queries."
+        )
+    headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"}
+
+    documents: list[Document] = []
+    after: str | None = None
+    while len(documents) < max_items:
+        response = requests.post(
+            _GITHUB_GRAPHQL_URL,
+            json={
+                "query": _DISCUSSIONS_GRAPHQL_QUERY,
+                "variables": {"owner": owner, "repo": repo, "after": after},
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("errors"):
+            raise ValueError(
+                f"GitHub GraphQL error loading discussions for {owner}/{repo}: {payload['errors']}"
+            )
+
+        connection = (payload.get("data") or {}).get("repository", {}).get("discussions", {})
+        nodes = connection.get("nodes", [])
+        if not nodes:
+            break
+
+        for node in nodes:
+            number = node["number"]
+            documents.append(
+                Document(
+                    content=_format_activity_content(
+                        node.get("title", ""), number, "open", node.get("body")
+                    ),
+                    metadata={
+                        "source_type": "code",
+                        "repository": f"{owner}/{repo}",
+                        "content_type": "discussion",
+                        "number": number,
+                        "author": (node.get("author") or {}).get("login"),
+                        "category": (node.get("category") or {}).get("name"),
+                        "url": node.get("url"),
+                        "file_name": f"Discussion #{number}: {node.get('title', '')}",
+                        "document_id": f"{owner}/{repo}:discussion:{number}",
+                    },
+                )
+            )
+            if len(documents) >= max_items:
+                break
+
+        page_info = connection.get("pageInfo", {})
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+
+    if len(documents) >= max_items:
+        logger.warning(
+            "GitHub repo %s/%s has more discussions than max_items=%d; only the first %d "
+            "(newest-created first) were loaded. Pass a higher max_items to load more.",
+            owner, repo, max_items, len(documents),
+        )
+
+    logger.info("Loaded %d discussion(s) from GitHub repo %s/%s", len(documents), owner, repo)
     return documents
 
 

@@ -10,8 +10,9 @@ Design:
   use, so callers never need to know which LLM provider/API shape is
   behind it (same "one place per concern" pattern used throughout this
   project - embedder.py, store.py, prompt_builder.py).
-- Provider used: Ollama, running locally at http://localhost:11434.
-  Ollama runs the model entirely on your machine - no API key, no
+- Provider used: Ollama, at http://localhost:11434 by default (override
+  via the OLLAMA_BASE_URL env var, e.g. for a Docker sidecar). Ollama
+  runs the model entirely on your machine/network - no API key, no
   network call to a third party, no billing. Same reasoning as the
   local embeddings decision.
 - Implemented with a raw HTTP call (requests) rather than the `ollama`
@@ -19,9 +20,12 @@ Design:
   of hidden behind a wrapper. A production version could swap this one
   function for `ollama.generate(...)` (the official client) without
   changing any other module - see the note at the bottom of this file.
-- stream=False is used so Ollama returns one complete JSON response
-  instead of a stream of partial-token chunks - simpler to handle for
-  a first version, at the cost of not showing tokens as they arrive.
+- stream=True is used (see generate_answer_stream below) so the read
+  timeout applies per-token instead of to the whole generation -
+  necessary once responses got long enough to blow past a single fixed
+  read-timeout window on CPU. generate_answer() itself is just
+  "".join(generate_answer_stream(...)) for callers that want the
+  finished string instead of live tokens.
 - temperature defaults to 0.0 (fully deterministic/greedy decoding).
   Grounded Q&A wants the model to stay close to the provided context,
   not "creatively" wander - and testing showed that even temperature
@@ -30,11 +34,34 @@ Design:
   identical retrieved context. temperature=0 removes that source of
   randomness; it does not fix genuine ambiguity in the prompt/context
   itself (see app.prompting.prompt_builder for that class of issue).
+- Answer caching: generate_answer_stream() (and therefore
+  generate_answer(), which is built on top of it) caches the finished
+  answer keyed by a hash of (model, temperature, the EXACT prompt
+  string) - the single biggest latency cost in this whole pipeline by
+  far (a 7B model on CPU: tens of seconds to minutes per question,
+  dwarfing retrieval's low-single-digit-seconds cost), and until now
+  it was never cached at all - an exact-repeat question re-ran the
+  full generation from scratch every time. This is safe specifically
+  BECAUSE temperature=0.0 is already deterministic by design (same
+  prompt in, same answer out, guaranteed) - only calls with
+  temperature=0.0 are cached; a caller explicitly asking for
+  temperature>0 wants varied output, so caching would silently defeat
+  that. Caching by the full PROMPT (not just the user's raw question)
+  is deliberate: the prompt already bakes in the retrieved context and
+  any conversation history (see app.prompting.prompt_builder), so a
+  cache key naturally changes - and correctly misses - whenever
+  anything that could affect the answer changes (different chunks
+  retrieved, edited source content re-ingested, a different
+  conversation thread's history), with no explicit invalidation logic
+  needed anywhere.
 """
 
 import base64
+import hashlib
 import json
 import logging
+import os
+from collections import OrderedDict
 from collections.abc import Iterator
 
 import requests
@@ -42,8 +69,32 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-_OLLAMA_URL = "http://localhost:11434/api/generate"
-_OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+# Bounded LRU-by-insertion-order cache of finished answers, keyed by
+# _answer_cache_key(). A plain OrderedDict (not functools.lru_cache) is
+# used deliberately: the cached function here is a GENERATOR that needs
+# to either replay a cached string or stream live tokens while
+# incrementally populating the cache - lru_cache only fits a pure
+# function returning one value up front, not that hybrid shape.
+_answer_cache: "OrderedDict[str, str]" = OrderedDict()
+_ANSWER_CACHE_MAXSIZE = 128
+
+
+def _answer_cache_key(prompt: str, model: str, temperature: float) -> str:
+    material = f"{model}::{temperature}::{prompt}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def clear_answer_cache() -> None:
+    """Wipe the answer cache (e.g. after switching model)."""
+    _answer_cache.clear()
+
+# OLLAMA_BASE_URL lets a containerized deployment point at an Ollama
+# instance running in a sidecar container (e.g. "http://ollama:11434")
+# instead of localhost - default preserves the original local-dev
+# behavior unchanged.
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+_OLLAMA_URL = f"{_OLLAMA_BASE_URL}/api/generate"
+_OLLAMA_CHAT_URL = f"{_OLLAMA_BASE_URL}/api/chat"
 # qwen2.5:7b-instruct follows retrieved context faithfully on RAG tasks
 # (technical docs, exact-code reproduction). The previous default,
 # llama3.2:3b, was too small: it routinely ignored the provided context
@@ -102,7 +153,23 @@ def generate_answer_stream(
     use of st.write_stream), so the user sees the answer taking shape
     on CPU-only hardware instead of staring at a spinner for 2-3 min
     while a 7B model reproduces a long JSON/code block verbatim.
+
+    Cached (see module docstring) when temperature == 0.0: an
+    exact-repeat call for the same (model, temperature, prompt) yields
+    the previously-generated answer as a single chunk instantly,
+    skipping the Ollama round-trip entirely, instead of streaming it
+    live again token by token.
     """
+    cache_key = _answer_cache_key(prompt, model, temperature) if temperature == 0.0 else None
+    if cache_key is not None and cache_key in _answer_cache:
+        _answer_cache.move_to_end(cache_key)  # mark most-recently-used
+        cached_answer = _answer_cache[cache_key]
+        logger.info(
+            "Answer cache hit (model='%s', prompt_chars=%d) - skipping Ollama call.", model, len(prompt)
+        )
+        yield cached_answer
+        return
+
     logger.info(
         "Streaming answer with model='%s', temperature=%.2f, prompt_chars=%d",
         model,
@@ -160,8 +227,16 @@ def generate_answer_stream(
     # with "done": true (and no more "response" content). Malformed
     # lines are skipped defensively rather than aborting the whole
     # generation, but note we don't expect any in practice.
+    #
+    # answer_parts accumulates the full answer ONLY when this call is
+    # cacheable (cache_key is not None), so the cache gets populated
+    # once the stream finishes normally - an exception raised anywhere
+    # in this loop (e.g. the RuntimeError below) propagates out of the
+    # generator without reaching the cache-write at the end, so a
+    # failed/partial generation is never cached.
     token_count = 0
     first_token_logged = False
+    answer_parts: list[str] | None = [] if cache_key is not None else None
     for raw_line in response.iter_lines(decode_unicode=True):
         if not raw_line:
             continue
@@ -184,10 +259,18 @@ def generate_answer_stream(
                 logger.info("Ollama produced first token; streaming continues.")
                 first_token_logged = True
             token_count += 1
+            if answer_parts is not None:
+                answer_parts.append(token)
             yield token
         if event.get("done"):
             break
     logger.info("Stream finished (%d tokens yielded).", token_count)
+
+    if cache_key is not None and answer_parts:
+        _answer_cache[cache_key] = "".join(answer_parts)
+        _answer_cache.move_to_end(cache_key)
+        while len(_answer_cache) > _ANSWER_CACHE_MAXSIZE:
+            _answer_cache.popitem(last=False)  # evict least-recently-used
 
 
 def _download_image_bytes(image_url: str, timeout: int = 10) -> bytes | None:

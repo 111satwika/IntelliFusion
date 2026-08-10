@@ -13,6 +13,8 @@ import requests
 
 from app.ingestion import ingest
 from app.ingestion.loader import Document
+from app.ocr.frame_analysis import FrameAnalysis
+from app.ocr.image_classifier import CODE, OTHER
 
 
 def test_load_all_documents_uses_matching_loader_per_extension(tmp_path, monkeypatch):
@@ -38,6 +40,15 @@ def test_load_all_documents_uses_matching_loader_per_extension(tmp_path, monkeyp
     assert documents[0].metadata["file_name"] == "a.md"
     assert documents[1].metadata["page_number"] == 1
     assert documents[2].metadata["page_number"] == 2
+
+
+def test_loaders_by_extension_includes_audio_and_video():
+    from app.ingestion.loader import load_audio_document, load_video_document
+
+    for ext in (".mp3", ".wav", ".m4a", ".flac", ".ogg"):
+        assert ingest._LOADERS_BY_EXTENSION[ext] is load_audio_document
+    for ext in (".mp4", ".mov", ".mkv", ".avi", ".webm"):
+        assert ingest._LOADERS_BY_EXTENSION[ext] is load_video_document
 
 
 def test_ingest_all_chunks_embeds_and_stores_every_document(tmp_path, monkeypatch):
@@ -114,6 +125,70 @@ def test_ingest_github_repo_chunks_embeds_and_stores_every_file(monkeypatch):
     assert calls[0] == ("load", "owner/repo", "main", 300)
     assert calls.count(("embed_chunks", ["chunk"])) == 2
     assert calls.count(("add_embedded_chunks", ["embedded"])) == 2
+
+
+def test_ingest_github_activity_chunks_embeds_and_stores_each_kind(monkeypatch):
+    issue_docs = [Document(content="issue text", metadata={"document_id": "owner/repo:issue:1"})]
+    pr_docs = [Document(content="pr text", metadata={"document_id": "owner/repo:pr:1"})]
+    discussion_docs = [
+        Document(content="d text", metadata={"document_id": "owner/repo:discussion:1"})
+    ]
+    calls = []
+
+    monkeypatch.setattr(ingest, "load_github_issues", lambda owner, repo, max_items: issue_docs)
+    monkeypatch.setattr(ingest, "load_github_pull_requests", lambda owner, repo, max_items: pr_docs)
+    monkeypatch.setattr(ingest, "load_github_discussions", lambda owner, repo, max_items: discussion_docs)
+    monkeypatch.setattr(ingest, "chunk_with_parent_child", lambda doc: ["chunk"])
+    monkeypatch.setattr(
+        ingest, "embed_chunks", lambda chunks: calls.append(("embed_chunks", chunks)) or ["embedded"]
+    )
+    monkeypatch.setattr(
+        ingest, "add_embedded_chunks", lambda embedded: calls.append(("add_embedded_chunks", embedded))
+    )
+
+    result = ingest.ingest_github_activity("owner/repo")
+
+    assert result == {
+        "repository": "owner/repo",
+        "issues": 1,
+        "pull_requests": 1,
+        "discussions": 1,
+        "chunks": 3,
+    }
+    assert calls.count(("embed_chunks", ["chunk"])) == 3
+    assert calls.count(("add_embedded_chunks", ["embedded"])) == 3
+
+
+def test_ingest_github_activity_respects_disabled_toggles(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        ingest,
+        "load_github_issues",
+        lambda owner, repo, max_items: calls.append("issues")
+        or [Document(content="i", metadata={"document_id": "x"})],
+    )
+    monkeypatch.setattr(
+        ingest,
+        "load_github_pull_requests",
+        lambda owner, repo, max_items: calls.append("prs") or [],
+    )
+    monkeypatch.setattr(
+        ingest,
+        "load_github_discussions",
+        lambda owner, repo, max_items: calls.append("discussions") or [],
+    )
+    monkeypatch.setattr(ingest, "chunk_with_parent_child", lambda doc: ["chunk"])
+    monkeypatch.setattr(ingest, "embed_chunks", lambda chunks: ["embedded"])
+    monkeypatch.setattr(ingest, "add_embedded_chunks", lambda embedded: None)
+
+    result = ingest.ingest_github_activity(
+        "owner/repo", include_issues=True, include_prs=False, include_discussions=False
+    )
+
+    assert calls == ["issues"]
+    assert result["pull_requests"] == 0
+    assert result["discussions"] == 0
 
 
 def test_read_urls_returns_empty_list_when_file_missing(tmp_path):
@@ -208,7 +283,7 @@ def test_ingest_images_stores_image_chunks_and_ocr_text_chunks(monkeypatch):
     monkeypatch.setattr(ingest, "download_image", lambda url: fake_image if url == records[0]["image_url"] else None)
     monkeypatch.setattr(ingest, "embed_images", lambda images: [[0.1, 0.2]])
     monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(("add_image_chunks", chunks)))
-    monkeypatch.setattr(ingest, "extract_text_from_image", lambda image: "def close_request(): ...")
+    monkeypatch.setattr(ingest, "analyze_frame", lambda image: FrameAnalysis(text="def close_request(): ...", image_type=OTHER))
     monkeypatch.setattr(ingest, "embed_texts", lambda texts: [[0.9, 0.8]])
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda chunks: calls.append(("add_embedded_chunks", chunks)))
 
@@ -235,7 +310,7 @@ def test_ingest_images_skips_ocr_text_chunk_when_no_text_found(monkeypatch):
     monkeypatch.setattr(ingest, "download_image", lambda url: fake_image)
     monkeypatch.setattr(ingest, "embed_images", lambda images: [[0.1, 0.2]])
     monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(("add_image_chunks", chunks)))
-    monkeypatch.setattr(ingest, "extract_text_from_image", lambda image: "")
+    monkeypatch.setattr(ingest, "analyze_frame", lambda image: FrameAnalysis(text="", image_type=OTHER))
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda chunks: calls.append(("add_embedded_chunks", chunks)))
 
     stored = ingest._ingest_images(document)
@@ -259,9 +334,114 @@ def test_ingest_images_skips_undownloadable_images(monkeypatch):
     assert ingest._ingest_images(Document(content="doc", metadata={})) == 0
 
 
-def _code_like_ocr_text():
-    # Classifies as "code" under app.ocr.image_classifier's real heuristic.
-    return "const request = context.GetEntity();\nif (request.EntityState.Name === 'Closed') {\n  return true;\n}"
+def test_ingest_images_marks_new_web_image_chunks_with_origin(monkeypatch):
+    # Regression guard: origin="web_image" must be written explicitly
+    # on every new web-image chunk (see app.ingestion.ingest's edit
+    # alongside this feature) so metadata.get("origin", "web_image")
+    # is a safe read pattern everywhere now that video frames can also
+    # land in the same collection with origin="video_frame".
+    document = Document(content="doc", metadata={"file_name": "page.html", "url": "https://example.com/page"})
+    records = [{"image_url": "https://example.com/icon.png", "alt_text": "icon", "page_url": None, "page_title": None}]
+    calls = []
+
+    monkeypatch.setattr(ingest, "extract_image_records", lambda doc: records)
+    monkeypatch.setattr(ingest, "download_image", lambda url: object())
+    monkeypatch.setattr(ingest, "embed_images", lambda images: [[0.1, 0.2]])
+    monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(chunks))
+    monkeypatch.setattr(ingest, "analyze_frame", lambda image: FrameAnalysis(text="", image_type=OTHER))
+
+    ingest._ingest_images(document)
+
+    assert calls[0][0]["metadata"]["origin"] == "web_image"
+
+
+def test_ingest_video_frames_embeds_and_stores_each_sampled_frame(monkeypatch):
+    document = Document(content="transcript", metadata={"document_id": "tutorial.mp4", "source_type": "video"})
+    fake_frames = [(0.0, "frame_at_0s"), (10.0, "frame_at_10s")]
+
+    monkeypatch.setattr(ingest, "_video_duration_seconds", lambda path: 15.0)
+    monkeypatch.setattr(ingest, "_sample_video_frames", lambda path, interval, duration: iter(fake_frames))
+    monkeypatch.setattr(ingest, "embed_images", lambda frames: [[0.1, 0.2], [0.3, 0.4]])
+    monkeypatch.setattr(
+        ingest.media_store, "save_frame_thumbnail",
+        lambda document_id, timestamp, frame: f"/media/frames/{document_id}_{int(timestamp)}.jpg",
+    )
+    calls = []
+    monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(chunks))
+
+    stored = ingest._ingest_video_frames(document, "tutorial.mp4")
+
+    assert stored == 2
+    chunks = calls[0]
+    assert chunks[0]["metadata"]["image_url"] == "/media/frames/tutorial.mp4_0.jpg"
+    assert chunks[0]["metadata"]["origin"] == "video_frame"
+    assert chunks[0]["metadata"]["video_document_id"] == "tutorial.mp4"
+    assert chunks[0]["metadata"]["timestamp_seconds"] == 0.0
+    assert chunks[1]["metadata"]["timestamp_seconds"] == 10.0
+
+
+def test_ingest_video_frames_returns_zero_when_no_frames_sampled(monkeypatch):
+    document = Document(content="transcript", metadata={"document_id": "silent.mp4", "source_type": "video"})
+
+    monkeypatch.setattr(ingest, "_video_duration_seconds", lambda path: 0.0)
+    monkeypatch.setattr(ingest, "_sample_video_frames", lambda path, interval, duration: iter([]))
+    calls = []
+    monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(chunks))
+
+    stored = ingest._ingest_video_frames(document, "silent.mp4")
+
+    assert stored == 0
+    assert not calls
+
+
+def test_ingest_audio_clips_is_a_noop_when_disabled(monkeypatch):
+    # Default state (ENABLE_AUDIO_SIMILARITY_SEARCH unset) - confirms
+    # the opt-in gate does no work at all, not even sampling.
+    monkeypatch.setattr(ingest, "_ENABLE_AUDIO_SIMILARITY_SEARCH", False)
+    document = Document(content="transcript", metadata={"document_id": "meeting.mp3", "source_type": "audio"})
+    calls = []
+    monkeypatch.setattr(ingest, "_sample_audio_clips", lambda path: calls.append(1) or iter([]))
+
+    stored = ingest._ingest_audio_clips(document, "meeting.mp3")
+
+    assert stored == 0
+    assert not calls
+
+
+def test_ingest_audio_clips_embeds_and_stores_each_sampled_clip(monkeypatch):
+    monkeypatch.setattr(ingest, "_ENABLE_AUDIO_SIMILARITY_SEARCH", True)
+    document = Document(content="transcript", metadata={"document_id": "meeting.mp3", "source_type": "audio"})
+    fake_clips = [(0.0, 10.0, "waveform_a"), (10.0, 17.0, "waveform_b")]
+
+    monkeypatch.setattr(ingest, "_sample_audio_clips", lambda path: iter(fake_clips))
+    monkeypatch.setattr(ingest, "embed_audio_clips", lambda waveforms: [[0.1, 0.2], [0.3, 0.4]])
+    monkeypatch.setattr(ingest.media_store, "save_media_copy", lambda document_id, path: f"/media/sources/{document_id}.mp3")
+    calls = []
+    monkeypatch.setattr(ingest, "add_audio_clip_chunks", lambda chunks: calls.append(chunks))
+
+    stored = ingest._ingest_audio_clips(document, "meeting.mp3")
+
+    assert stored == 2
+    chunks = calls[0]
+    assert chunks[0]["metadata"]["document_id"] == "meeting.mp3"
+    assert chunks[0]["metadata"]["start_seconds"] == 0.0
+    assert chunks[0]["metadata"]["end_seconds"] == 10.0
+    assert chunks[0]["metadata"]["source_audio_url"] == "/media/sources/meeting.mp3.mp3"
+    assert chunks[1]["metadata"]["start_seconds"] == 10.0
+
+
+def test_ingest_audio_clips_returns_zero_when_no_clips_sampled(monkeypatch):
+    monkeypatch.setattr(ingest, "_ENABLE_AUDIO_SIMILARITY_SEARCH", True)
+    document = Document(content="transcript", metadata={"document_id": "silent.mp4", "source_type": "video"})
+
+    monkeypatch.setattr(ingest, "_sample_audio_clips", lambda path: iter([]))
+    calls = []
+    monkeypatch.setattr(ingest, "add_audio_clip_chunks", lambda chunks: calls.append(chunks))
+
+    stored = ingest._ingest_audio_clips(document, "silent.mp4")
+
+    assert stored == 0
+    assert not calls
 
 
 def test_ingest_images_runs_vision_extraction_for_code_classified_images(monkeypatch):
@@ -281,11 +461,7 @@ def test_ingest_images_runs_vision_extraction_for_code_classified_images(monkeyp
     monkeypatch.setattr(ingest, "download_image", lambda url: fake_image)
     monkeypatch.setattr(ingest, "embed_images", lambda images: [[0.1, 0.2]])
     monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(("add_image_chunks", chunks)))
-    monkeypatch.setattr(ingest, "extract_text_from_image", lambda image: _code_like_ocr_text())
-    monkeypatch.setattr(
-        ingest, "generate_vision_text", lambda image, instruction: "const request = context.GetEntity();"
-    )
-    monkeypatch.setattr(ingest, "combine_ocr_and_vision", lambda ocr_text, vision_text: "COMBINED_TEXT")
+    monkeypatch.setattr(ingest, "analyze_frame", lambda image: FrameAnalysis(text="COMBINED_TEXT", image_type=CODE))
     monkeypatch.setattr(ingest, "embed_texts", lambda texts: [[0.9, 0.8]])
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda chunks: calls.append(("add_embedded_chunks", chunks)))
 
@@ -297,35 +473,6 @@ def test_ingest_images_runs_vision_extraction_for_code_classified_images(monkeyp
     assert "COMBINED_TEXT" in code_chunk.content
 
 
-def test_ingest_images_falls_back_to_ocr_only_when_vision_extraction_fails(monkeypatch):
-    document = Document(content="doc", metadata={"file_name": "page.html", "url": "https://example.com/page"})
-    records = [
-        {
-            "image_url": "https://example.com/code.png",
-            "alt_text": "Close a Request example",
-            "page_url": "https://example.com/page",
-            "page_title": "page.html",
-        }
-    ]
-    fake_image = object()
-    calls = []
-
-    def failing_vision(image, instruction):
-        raise TimeoutError("vision model too slow")
-
-    monkeypatch.setattr(ingest, "extract_image_records", lambda doc: records)
-    monkeypatch.setattr(ingest, "download_image", lambda url: fake_image)
-    monkeypatch.setattr(ingest, "embed_images", lambda images: [[0.1, 0.2]])
-    monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(("add_image_chunks", chunks)))
-    monkeypatch.setattr(ingest, "extract_text_from_image", lambda image: _code_like_ocr_text())
-    monkeypatch.setattr(ingest, "generate_vision_text", failing_vision)
-    monkeypatch.setattr(ingest, "combine_ocr_and_vision", lambda ocr_text, vision_text: ocr_text)
-    monkeypatch.setattr(ingest, "embed_texts", lambda texts: [[0.9, 0.8]])
-    monkeypatch.setattr(ingest, "add_embedded_chunks", lambda chunks: calls.append(("add_embedded_chunks", chunks)))
-
-    stored = ingest._ingest_images(document)
-
-    assert stored == 1
-    code_chunk = calls[1][1][0]
-    assert code_chunk.metadata["content_type"] == "image_code"
-    assert "const request" in code_chunk.content
+# Vision-failure fallback (vision call raises -> keep OCR-only text) is
+# now app.ocr.frame_analysis.analyze_frame's own responsibility, not
+# _ingest_images's - see tests/test_frame_analysis.py for that case.

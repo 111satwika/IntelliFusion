@@ -66,6 +66,7 @@ Design:
 """
 
 import logging
+import random
 from pathlib import Path
 
 import chromadb
@@ -76,28 +77,37 @@ logger = logging.getLogger(__name__)
 
 CHROMA_DB_DIR = str(Path(__file__).resolve().parent.parent.parent / "data" / "chroma_db")
 IMAGE_COLLECTION_NAME = "rag_image_chunks"
+AUDIO_CLIP_COLLECTION_NAME = "rag_audio_clip_chunks"
 
 
 def _invalidate_hybrid_cache(kb: str) -> None:
     """
-    Drop any BM25/hybrid-retriever caches for the given KB whenever
-    its stored chunks change. Lazily imported to avoid a circular
-    dependency (hybrid_retriever imports from this module).
+    Drop any BM25/hybrid-retriever AND KB-routing caches for the given
+    KB whenever its stored chunks change. Lazily imported to avoid a
+    circular dependency (both hybrid_retriever and router import from
+    this module).
 
-    Silently no-ops if the hybrid module isn't importable (e.g. in a
-    test environment that stubs out retrieval).
+    Silently no-ops if a module isn't importable (e.g. in a test
+    environment that stubs out retrieval/routing).
     """
     try:
         from app.retrieval.hybrid_retriever import invalidate_bm25_cache
     except ImportError:
+        pass
+    else:
+        invalidate_bm25_cache(kb)
+
+    try:
+        from app.routing.router import invalidate_kb_routing_cache
+    except ImportError:
         return
-    invalidate_bm25_cache(kb)
+    invalidate_kb_routing_cache(kb)
 
 
 # One Chroma collection per source "knowledge base" (see module
 # docstring). Order here is only for readability/logging - it has no
 # effect on routing or search results.
-KB_NAMES = ["markdown", "pdf", "docx", "web", "github"]
+KB_NAMES = ["markdown", "pdf", "docx", "web", "github", "audio", "video"]
 
 _COLLECTION_NAME_BY_KB = {kb: f"rag_chunks_{kb}" for kb in KB_NAMES}
 
@@ -112,6 +122,8 @@ _SOURCE_TYPE_TO_KB = {
     "docx": "docx",
     "web": "web",
     "code": "github",
+    "audio": "audio",
+    "video": "video",
 }
 
 # Fallback KB for a chunk whose metadata has no recognized source_type
@@ -124,6 +136,7 @@ _DEFAULT_KB = "markdown"
 _client = None
 _collections: dict[str, object] = {}
 _image_collection = None
+_audio_clip_collection = None
 
 
 def _get_client():
@@ -170,6 +183,22 @@ def _get_image_collection():
             metadata={"hnsw:space": "cosine"},
         )
     return _image_collection
+
+
+def _get_audio_clip_collection():
+    """
+    Lazily create the audio-clip collection (see
+    app.embeddings.audio_embedder's module docstring for why this is
+    separate from both the text KBs AND the image collection - CLAP's
+    vector space has nothing in common with either).
+    """
+    global _audio_clip_collection
+    if _audio_clip_collection is None:
+        _audio_clip_collection = _get_client().get_or_create_collection(
+            name=AUDIO_CLIP_COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+    return _audio_clip_collection
 
 
 def _sanitize_metadata(metadata: dict) -> dict:
@@ -303,6 +332,47 @@ def query_embedding(query_vector: list[float], top_k: int = 5, where: dict | Non
 
     logger.info("Query returned %d result(s) for top_k=%d in KB '%s'", len(hits), top_k, kb)
     return hits
+
+
+def sample_kb_embeddings(kb: str, limit: int = 40) -> list[list[float]]:
+    """
+    Return up to `limit` embeddings already stored in `kb`'s
+    collection, chosen by random sample (not just the first N Chroma
+    happens to return, which could skew toward whichever document was
+    ingested first).
+
+    Used by app.routing.router to route a query by comparing it
+    against a sample of what's ACTUALLY been ingested into each KB,
+    instead of a fixed set of hand-written example questions that
+    can't anticipate every deployment's real subject matter (e.g. a
+    KB full of Targetprocess automation-rule docs needs a very
+    different "what does a typical question here look like" signal
+    than a KB of API reference PDFs would). No extra embedding cost:
+    Chroma already stores each chunk's vector, so this is a plain
+    fetch, not a re-embed.
+
+    Returns [] for an empty/unpopulated KB - the caller treats that
+    the same as any other KB with no semantic signal to offer.
+    """
+    collection = _get_collection(kb)
+    all_ids = collection.get(include=[])["ids"]
+    if not all_ids:
+        return []
+    sample_ids = random.sample(all_ids, min(limit, len(all_ids)))
+    result = collection.get(ids=sample_ids, include=["embeddings"])
+    embeddings = result.get("embeddings")
+    if embeddings is None or len(embeddings) == 0:
+        return []
+    # Cast every component to a native Python float - Chroma returns
+    # embeddings as numpy float32 arrays, and a bare list(vector) keeps
+    # numpy.float32 scalars in the list. Those silently poison every
+    # downstream score derived from them (app.routing.router's cosine
+    # similarities) with numpy scalar types instead of plain floats -
+    # harmless for arithmetic, but numpy.bool_ (from e.g. `score >=
+    # 0.40` in insight.py) is NOT json-serializable the way a native
+    # Python bool is, so an unconverted embedding here eventually broke
+    # the entire /api/chat/stream response with a 500 mid-stream.
+    return [[float(x) for x in vector] for vector in embeddings]
 
 
 def get_table_chunk(table_id: str) -> dict | None:
@@ -491,10 +561,45 @@ def list_repositories() -> list[str]:
     return sorted(repositories)
 
 
+def list_documents(kb: str) -> list[dict]:
+    """
+    Every distinct document currently stored in one KB, with its
+    stored chunk count.
+
+    For kb="github", documents are grouped by `repository` (one row
+    per ingested repo) rather than by individual file `document_id`,
+    matching how the GitHub KB is ingested/deleted as a whole repo
+    (see delete_repository()). Every other KB is grouped by
+    `document_id` (see delete_document()).
+
+    Used by the UI to show what's already indexed in a KB, as opposed
+    to what's merely pending-in-this-session (see
+    data/pending_documents.json / ui.state).
+
+    Returns:
+        A list of {"id": str, "chunk_count": int} dicts, sorted by id.
+        "id" is a document_id for every KB except "github", where
+        it's an "owner/repo" repository name.
+    """
+    collection = _get_collection(kb)
+    result = collection.get(include=["metadatas"])
+    group_field = "repository" if kb == "github" else "document_id"
+    counts: dict[str, int] = {}
+    for metadata in result["metadatas"]:
+        key = metadata.get(group_field)
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return [{"id": doc_id, "chunk_count": n} for doc_id, n in sorted(counts.items())]
+
+
 def delete_document(document_id: str, kb: str | None = None) -> int:
     """
     Delete every chunk whose metadata `document_id` matches the given
-    value. Returns the number of chunks removed.
+    value, PLUS any video frames / audio clips / saved media files
+    associated with it. Returns the number of TEXT chunks removed
+    (unchanged return contract for existing callers - frame/clip/file
+    cleanup counts are only logged, not returned).
 
     Args:
         document_id: The document_id metadata value written by the
@@ -506,6 +611,15 @@ def delete_document(document_id: str, kb: str | None = None) -> int:
 
     Used by the UI's "discard" and auto-cleanup-of-abandoned-session
     paths to remove ingested-but-not-saved documents (see app_ui.py).
+
+    Image-collection and audio-clip-collection cleanup is checked
+    UNCONDITIONALLY of `kb`, since both are separate collections
+    outside the per-KB text collections `kb` scopes - a video's frames
+    live in the image collection regardless of which text KB argument
+    was passed. Before this, deleting a video/audio document left its
+    frames, clips, and saved media files under data/media/ orphaned
+    forever - there was no cleanup path for them at all (see
+    app.media.media_store.delete_media_for_document).
     """
     collections = [_get_collection(kb)] if kb is not None else list(_iter_collections())
     total_deleted = 0
@@ -524,6 +638,30 @@ def delete_document(document_id: str, kb: str | None = None) -> int:
         logger.info("Deleted %d chunk(s) for document_id=%r", total_deleted, document_id)
     for affected_kb in affected_kbs:
         _invalidate_hybrid_cache(affected_kb)
+
+    # Video frames are tagged video_document_id; website-page images
+    # are tagged page_url (== document_id for a web page - see
+    # app.ingestion.loader._build_website_document/extract_image_records).
+    # A document is never both, so both filters are checked, not just one.
+    image_collection = _get_image_collection()
+    for field in ("video_document_id", "page_url"):
+        existing = image_collection.get(where={field: document_id}, include=[])
+        ids = existing["ids"]
+        if ids:
+            image_collection.delete(ids=ids)
+            logger.info("Deleted %d image chunk(s) (%s=%r)", len(ids), field, document_id)
+
+    audio_collection = _get_audio_clip_collection()
+    existing = audio_collection.get(where={"document_id": document_id}, include=[])
+    ids = existing["ids"]
+    if ids:
+        audio_collection.delete(ids=ids)
+        logger.info("Deleted %d audio clip(s) (document_id=%r)", len(ids), document_id)
+
+    from app.media.media_store import delete_media_for_document
+
+    delete_media_for_document(document_id)
+
     return total_deleted
 
 
@@ -544,6 +682,7 @@ def delete_repository(repository: str) -> int:
     if ids:
         collection.delete(ids=ids)
         logger.info("Deleted %d chunk(s) for repository=%r", len(ids), repository)
+        _invalidate_hybrid_cache("github")
     return len(ids)
 
 
@@ -587,7 +726,7 @@ def add_image_chunks(image_chunks: list[dict]) -> None:
     logger.info("Stored/updated %d image chunk(s) in collection '%s'", len(ids), IMAGE_COLLECTION_NAME)
 
 
-def query_image_embedding(query_vector: list[float], top_k: int = 3) -> list[dict]:
+def query_image_embedding(query_vector: list[float], top_k: int = 3, where: dict | None = None) -> list[dict]:
     """
     Find the top_k stored images most similar to a query embedding.
 
@@ -596,6 +735,13 @@ def query_image_embedding(query_vector: list[float], top_k: int = 3) -> list[dic
     never from the text-only all-MiniLM-L6-l2 model used for
     query_embedding() above - the two live in unrelated vector spaces.
 
+    where: optional Chroma metadata filter (e.g. {"source_kb": "video"})
+    - see app.retrieval.retriever.retrieve_images for why this matters:
+    without it, a question scoped to one KB tab (e.g. "video") would
+    match against EVERY stored image regardless of origin (other
+    videos, unrelated web screenshots), since this collection is
+    shared across all image sources (see module docstring).
+
     Returns:
         Same shape as query_embedding(): a list of dicts with
         "content" (alt text), "metadata", "distance", and
@@ -603,7 +749,7 @@ def query_image_embedding(query_vector: list[float], top_k: int = 3) -> list[dic
     """
     collection = _get_image_collection()
 
-    results = collection.query(query_embeddings=[query_vector], n_results=top_k)
+    results = collection.query(query_embeddings=[query_vector], n_results=top_k, where=where)
 
     hits: list[dict] = []
     documents = results["documents"][0]
@@ -627,6 +773,94 @@ def query_image_embedding(query_vector: list[float], top_k: int = 3) -> list[dic
 def image_count() -> int:
     """Return how many images are currently stored."""
     return _get_image_collection().count()
+
+
+def add_audio_clip_chunks(clip_chunks: list[dict]) -> None:
+    """
+    Store a list of CLAP-embedded audio clips in the separate
+    audio-clip collection.
+
+    Args:
+        clip_chunks: list of dicts, each with "embedding" (a CLAP
+            audio embedding from app.embeddings.audio_embedder),
+            "content" (a short label, kept as the stored document for
+            citation/debugging), and "metadata" (must include
+            "document_id" and "start_seconds" - used together as the
+            stable id, since - unlike a web image's URL - an audio
+            clip has no natural external id of its own; mirrors
+            add_embedded_chunks()'s own "{document_id}::..." id
+            convention rather than add_image_chunks()'s image_url-as-id
+            convention).
+    """
+    if not clip_chunks:
+        return
+
+    collection = _get_audio_clip_collection()
+
+    ids: list[str] = []
+    embeddings: list[list[float]] = []
+    documents: list[str] = []
+    metadatas: list[dict] = []
+
+    for clip_chunk in clip_chunks:
+        metadata = clip_chunk["metadata"]
+        clip_id = f"{metadata['document_id']}::clip_{metadata['start_seconds']}"
+        ids.append(clip_id)
+        embeddings.append(clip_chunk["embedding"])
+        documents.append(clip_chunk["content"])
+        metadatas.append(_sanitize_metadata(metadata))
+
+    collection.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+    logger.info("Stored/updated %d audio clip(s) in collection '%s'", len(ids), AUDIO_CLIP_COLLECTION_NAME)
+
+
+def query_audio_clip_embedding(query_vector: list[float], top_k: int = 3, where: dict | None = None) -> list[dict]:
+    """
+    Find the top_k stored audio clips most similar to a query
+    embedding.
+
+    query_vector MUST come from the same CLAP model used to embed the
+    stored clips (app.embeddings.audio_embedder.embed_text_for_audio_search),
+    never from the text-only all-MiniLM-L6-v2 model or the CLIP image
+    model - all three live in unrelated vector spaces.
+
+    where: optional Chroma metadata filter (e.g. {"source_kb": "video"}
+    - see app.retrieval.retriever.retrieve_audio_clips). Without this,
+    a question scoped to one KB tab would match against every clip
+    from every ingested audio/video file, since this collection has no
+    other notion of "which KB" a clip belongs to.
+
+    Returns:
+        Same shape as query_embedding()/query_image_embedding(): a
+        list of dicts with "content", "metadata", "distance", and
+        "similarity", ordered from most to least similar.
+    """
+    collection = _get_audio_clip_collection()
+
+    results = collection.query(query_embeddings=[query_vector], n_results=top_k, where=where)
+
+    hits: list[dict] = []
+    documents = results["documents"][0]
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    for content, metadata, distance in zip(documents, metadatas, distances):
+        hits.append(
+            {
+                "content": content,
+                "metadata": metadata,
+                "distance": distance,
+                "similarity": 1 - distance,
+            }
+        )
+
+    logger.info("Audio clip query returned %d result(s) for top_k=%d", len(hits), top_k)
+    return hits
+
+
+def audio_clip_count() -> int:
+    """Return how many audio clips are currently stored."""
+    return _get_audio_clip_collection().count()
 
 
 if __name__ == "__main__":

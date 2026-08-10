@@ -17,10 +17,12 @@ def isolated_store(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "_client", None)
     monkeypatch.setattr(store, "_collections", {})
     monkeypatch.setattr(store, "_image_collection", None)
+    monkeypatch.setattr(store, "_audio_clip_collection", None)
     yield store
     monkeypatch.setattr(store, "_client", None)
     monkeypatch.setattr(store, "_collections", {})
     monkeypatch.setattr(store, "_image_collection", None)
+    monkeypatch.setattr(store, "_audio_clip_collection", None)
 
 
 def test_add_and_query_roundtrip(isolated_store):
@@ -88,6 +90,16 @@ def test_add_embedded_chunks_routes_each_chunk_to_its_kb_by_source_type(isolated
             embedding=[1.0, 0.0],
             metadata={"document_id": "owner/repo:README.md", "chunk_index": 0, "source_type": "code"},
         ),
+        EmbeddedChunk(
+            content="an audio transcript chunk",
+            embedding=[1.0, 0.0],
+            metadata={"document_id": "meeting.mp3", "chunk_index": 0, "source_type": "audio"},
+        ),
+        EmbeddedChunk(
+            content="a video transcript+frame chunk",
+            embedding=[1.0, 0.0],
+            metadata={"document_id": "tutorial.mp4", "chunk_index": 0, "source_type": "video"},
+        ),
     ]
 
     isolated_store.add_embedded_chunks(chunks)
@@ -97,7 +109,9 @@ def test_add_embedded_chunks_routes_each_chunk_to_its_kb_by_source_type(isolated
     assert isolated_store.count(kb="docx") == 1
     assert isolated_store.count(kb="web") == 1
     assert isolated_store.count(kb="github") == 1
-    assert isolated_store.count() == 5  # total across every KB
+    assert isolated_store.count(kb="audio") == 1
+    assert isolated_store.count(kb="video") == 1
+    assert isolated_store.count() == 7  # total across every KB
 
 
 def test_add_embedded_chunks_falls_back_to_markdown_kb_for_unrecognized_source_type(isolated_store):
@@ -402,3 +416,246 @@ def test_add_image_chunks_upserts_by_image_url(isolated_store):
     assert isolated_store.image_count() == 1
     results = isolated_store.query_image_embedding([0.0, 1.0], top_k=1)
     assert results[0]["content"] == "new alt text"
+
+
+def test_query_image_embedding_where_filter_scopes_by_source_kb(isolated_store):
+    # Regression test: without a working where filter, a web
+    # screenshot (or a frame from an unrelated video) can outrank/
+    # replace the correct frame for a KB-scoped video question.
+    image_chunks = [
+        {
+            "content": "video frame",
+            "embedding": [1.0, 0.0],
+            "metadata": {"image_url": "/media/frames/a.jpg", "source_kb": "video"},
+        },
+        {
+            "content": "web screenshot",
+            "embedding": [1.0, 0.0],
+            "metadata": {"image_url": "https://example.com/b.png", "source_kb": "web"},
+        },
+    ]
+    isolated_store.add_image_chunks(image_chunks)
+
+    results = isolated_store.query_image_embedding([1.0, 0.0], top_k=5, where={"source_kb": "video"})
+
+    assert len(results) == 1
+    assert results[0]["content"] == "video frame"
+
+
+def test_add_and_query_audio_clip_roundtrip(isolated_store):
+    clip_chunks = [
+        {
+            "content": "Clip from meeting.mp3 at 00:00",
+            "embedding": [1.0, 0.0],
+            "metadata": {"document_id": "meeting.mp3", "start_seconds": 0.0, "end_seconds": 10.0},
+        },
+        {
+            "content": "Clip from meeting.mp3 at 00:10",
+            "embedding": [0.0, 1.0],
+            "metadata": {"document_id": "meeting.mp3", "start_seconds": 10.0, "end_seconds": 20.0},
+        },
+    ]
+
+    isolated_store.add_audio_clip_chunks(clip_chunks)
+
+    assert isolated_store.audio_clip_count() == 2
+    # Neither the text-chunk nor the image collection is touched by
+    # audio-clip storage - three genuinely separate embedding spaces.
+    assert isolated_store.count() == 0
+    assert isolated_store.image_count() == 0
+
+    results = isolated_store.query_audio_clip_embedding([1.0, 0.0], top_k=1)
+
+    assert len(results) == 1
+    assert results[0]["content"] == "Clip from meeting.mp3 at 00:00"
+    assert results[0]["metadata"]["document_id"] == "meeting.mp3"
+    assert results[0]["similarity"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_query_audio_clip_embedding_where_filter_scopes_by_source_kb(isolated_store):
+    # Regression test: without a working where filter, a clip from an
+    # unrelated file (different source_kb) can outrank/replace the
+    # correct clip for a KB-scoped question.
+    clip_chunks = [
+        {
+            "content": "video clip",
+            "embedding": [1.0, 0.0],
+            "metadata": {"document_id": "surf.mp4", "start_seconds": 0.0, "source_kb": "video"},
+        },
+        {
+            "content": "unrelated audio clip",
+            "embedding": [1.0, 0.0],
+            "metadata": {"document_id": "unrelated.mp3", "start_seconds": 0.0, "source_kb": "audio"},
+        },
+    ]
+    isolated_store.add_audio_clip_chunks(clip_chunks)
+
+    results = isolated_store.query_audio_clip_embedding([1.0, 0.0], top_k=5, where={"source_kb": "video"})
+
+    assert len(results) == 1
+    assert results[0]["content"] == "video clip"
+
+
+def test_add_audio_clip_chunks_with_empty_list_is_a_no_op(isolated_store):
+    isolated_store.add_audio_clip_chunks([])
+    assert isolated_store.audio_clip_count() == 0
+
+
+def test_add_audio_clip_chunks_upserts_by_document_id_and_start_seconds(isolated_store):
+    clip_chunk = {
+        "content": "old label",
+        "embedding": [1.0, 0.0],
+        "metadata": {"document_id": "meeting.mp3", "start_seconds": 0.0},
+    }
+    isolated_store.add_audio_clip_chunks([clip_chunk])
+
+    updated_chunk = {
+        "content": "new label",
+        "embedding": [0.0, 1.0],
+        "metadata": {"document_id": "meeting.mp3", "start_seconds": 0.0},
+    }
+    isolated_store.add_audio_clip_chunks([updated_chunk])
+
+    assert isolated_store.audio_clip_count() == 1
+    results = isolated_store.query_audio_clip_embedding([0.0, 1.0], top_k=1)
+    assert results[0]["content"] == "new label"
+
+
+def test_sample_kb_embeddings_returns_empty_list_for_unpopulated_kb(isolated_store):
+    assert isolated_store.sample_kb_embeddings("markdown") == []
+
+
+def test_sample_kb_embeddings_returns_stored_vectors(isolated_store):
+    chunks = [
+        EmbeddedChunk(content="a", embedding=[1.0, 0.0], metadata={"file_name": "doc.md", "chunk_index": 0}),
+        EmbeddedChunk(content="b", embedding=[0.0, 1.0], metadata={"file_name": "doc.md", "chunk_index": 1}),
+    ]
+    isolated_store.add_embedded_chunks(chunks)
+
+    sample = isolated_store.sample_kb_embeddings("markdown", limit=10)
+
+    assert len(sample) == 2
+    assert sorted(tuple(v) for v in sample) == [(0.0, 1.0), (1.0, 0.0)]
+
+
+def test_sample_kb_embeddings_caps_at_limit(isolated_store):
+    chunks = [
+        EmbeddedChunk(content=f"chunk {i}", embedding=[float(i), 0.0], metadata={"file_name": "doc.md", "chunk_index": i})
+        for i in range(10)
+    ]
+    isolated_store.add_embedded_chunks(chunks)
+
+    sample = isolated_store.sample_kb_embeddings("markdown", limit=3)
+
+    assert len(sample) == 3
+
+
+def test_sample_kb_embeddings_only_looks_at_the_requested_kb(isolated_store):
+    isolated_store.add_embedded_chunks([
+        EmbeddedChunk(content="md", embedding=[1.0, 0.0], metadata={"source_type": "markdown", "file_name": "a.md", "chunk_index": 0}),
+        EmbeddedChunk(content="pdf", embedding=[0.0, 1.0], metadata={"source_type": "pdf", "file_name": "b.pdf", "chunk_index": 0}),
+    ])
+
+    assert len(isolated_store.sample_kb_embeddings("markdown", limit=10)) == 1
+    assert len(isolated_store.sample_kb_embeddings("pdf", limit=10)) == 1
+
+
+def test_sample_kb_embeddings_returns_native_python_floats_not_numpy_scalars(isolated_store):
+    # Regression test: Chroma stores/returns embeddings as numpy float32
+    # arrays, and a bare `list(vector)` keeps numpy.float32 scalars in
+    # the returned list rather than converting to native floats. That's
+    # invisible to == comparisons (numpy.float32(1.0) == 1.0 is True,
+    # see the roundtrip test above) but poisons every score derived
+    # from these vectors downstream (app.routing.router's cosine
+    # similarities) with numpy scalar types - in particular,
+    # `numpy_float >= threshold` produces numpy.bool_, which (unlike a
+    # native bool) json.dumps cannot serialize. This broke the entire
+    # /api/chat/stream response with a 500 mid-stream once routing
+    # scores reached insight.py's JSON payload.
+    isolated_store.add_embedded_chunks([
+        EmbeddedChunk(content="a", embedding=[1.0, 0.0], metadata={"file_name": "doc.md", "chunk_index": 0}),
+    ])
+
+    sample = isolated_store.sample_kb_embeddings("markdown", limit=10)
+
+    assert all(type(component) is float for vector in sample for component in vector)
+
+
+def test_delete_document_removes_matching_text_chunks(isolated_store):
+    chunks = [
+        EmbeddedChunk(content="a", embedding=[1.0, 0.0], metadata={"document_id": "keep.md", "chunk_index": 0}),
+        EmbeddedChunk(content="b", embedding=[1.0, 0.0], metadata={"document_id": "delete.md", "chunk_index": 0}),
+    ]
+    isolated_store.add_embedded_chunks(chunks)
+
+    deleted = isolated_store.delete_document("delete.md")
+
+    assert deleted == 1
+    assert isolated_store.count() == 1
+
+
+def test_delete_document_removes_video_frames_from_the_image_collection(isolated_store, monkeypatch):
+    # Regression test: before this, deleting a video's text chunks left
+    # its frames orphaned in the image collection forever - there was
+    # no cleanup path for them at all.
+    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: 0)
+    isolated_store.add_embedded_chunks([
+        EmbeddedChunk(content="transcript", embedding=[1.0, 0.0], metadata={"document_id": "tutorial.mp4", "chunk_index": 0, "source_type": "video"}),
+    ])
+    isolated_store.add_image_chunks([
+        {
+            "content": "Frame from tutorial.mp4 at 00:00",
+            "embedding": [1.0, 0.0],
+            "metadata": {"image_url": "/media/frames/abc_0.jpg", "video_document_id": "tutorial.mp4", "origin": "video_frame"},
+        },
+        {
+            "content": "an unrelated web screenshot",
+            "embedding": [1.0, 0.0],
+            "metadata": {"image_url": "https://example.com/other.png", "origin": "web_image"},
+        },
+    ])
+
+    isolated_store.delete_document("tutorial.mp4")
+
+    assert isolated_store.image_count() == 1  # only the unrelated web image survives
+    remaining = isolated_store.query_image_embedding([1.0, 0.0], top_k=5)
+    assert all(hit["metadata"].get("video_document_id") != "tutorial.mp4" for hit in remaining)
+
+
+def test_delete_document_removes_web_page_images_by_page_url(isolated_store, monkeypatch):
+    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: 0)
+    isolated_store.add_image_chunks([
+        {
+            "content": "diagram",
+            "embedding": [1.0, 0.0],
+            "metadata": {"image_url": "https://example.com/diagram.png", "page_url": "https://example.com/docs", "origin": "web_image"},
+        },
+    ])
+
+    isolated_store.delete_document("https://example.com/docs")
+
+    assert isolated_store.image_count() == 0
+
+
+def test_delete_document_removes_audio_clips(isolated_store, monkeypatch):
+    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: 0)
+    isolated_store.add_audio_clip_chunks([
+        {
+            "content": "clip",
+            "embedding": [1.0, 0.0],
+            "metadata": {"document_id": "meeting.mp3", "start_seconds": 0.0},
+        },
+    ])
+
+    isolated_store.delete_document("meeting.mp3")
+
+    assert isolated_store.audio_clip_count() == 0
+
+
+def test_delete_document_calls_media_store_cleanup_with_the_document_id(isolated_store, monkeypatch):
+    calls = []
+    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: calls.append(document_id) or 0)
+
+    isolated_store.delete_document("tutorial.mp4")
+
+    assert calls == ["tutorial.mp4"]

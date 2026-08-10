@@ -52,6 +52,7 @@ import re
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
+from app.embeddings.embedder import embed_texts
 from app.vectorstore.store import _get_collection, query_embedding
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ logger = logging.getLogger(__name__)
 # to another prose-heavy KB is a one-line change. GitHub and Web
 # additionally layer a parent-child sentence-window retriever on top
 # (see _PARENT_CHILD_KBS).
-_HYBRID_KBS = {"pdf", "docx", "markdown", "github", "web"}
+_HYBRID_KBS = {"pdf", "docx", "markdown", "github", "web", "audio", "video"}
 
 # Which KBs store parent+child chunks (see app.chunking.parent_child).
 # Retrieval for these KBs adds a third ranked list to the RRF fusion:
@@ -531,6 +532,9 @@ def retrieve_hybrid(
     kb: str,
     top_k: int,
     where: dict | None = None,
+    variants: list[str] | None = None,
+    hyde_answer: str | None = None,
+    keywords: list[str] | None = None,
 ) -> list[dict]:
     """
     Full pipeline: dense + BM25 (+ parent-child, for KBs that support
@@ -549,6 +553,23 @@ def retrieve_hybrid(
         where: Chroma-style metadata filter (e.g. repository scope).
             Passed through to every retriever so the fused list stays
             consistent with the caller's scoping.
+        variants: Optional list of additional text queries produced by
+            app.retrieval.query_transform (rewrite / paraphrases /
+            sub-questions). Each variant is embedded and dense-searched
+            + BM25-searched independently; every ranked list joins the
+            RRF fusion. The original ``query_text`` is always included
+            regardless. Cross-encoder rerank still scores against the
+            ORIGINAL ``query_text`` so the final ordering never drifts
+            away from the user's actual intent.
+        hyde_answer: Optional HyDE-style hypothetical answer paragraph.
+            When provided, it is embedded and added as an extra
+            dense-only ranked list (no BM25 - a synthesized paragraph
+            has little exact-token value beyond what the paraphrases
+            already give BM25).
+        keywords: Optional topical keyword list produced by
+            query_transform. When provided, the space-joined keywords
+            are added as an extra BM25-only ranked list (no dense -
+            dense of a 3-word bag-of-terms is a poor query).
 
     Returns:
         A list of hit dicts (same shape as query_embedding's output,
@@ -556,14 +577,56 @@ def retrieve_hybrid(
         "cross_encoder_score" fields populated where applicable).
     """
     logger.info(
-        "Hybrid retrieval (kb=%s): query=%r top_k=%d where=%r",
+        "Hybrid retrieval (kb=%s): query=%r top_k=%d where=%r variants=%d hyde=%s keywords=%d",
         kb, query_text, top_k, where,
+        len(variants) if variants else 0,
+        bool(hyde_answer),
+        len(keywords) if keywords else 0,
     )
 
-    dense_hits = _dense_search(query_vector, kb, _DENSE_POOL_SIZE, where)
-    bm25_hits = _bm25_search(query_text, kb, _BM25_POOL_SIZE, where)
-    ranked_lists = [dense_hits, bm25_hits]
+    ranked_lists: list[list[dict]] = []
 
+    # Primary pass: original query text with the pre-embedded vector.
+    ranked_lists.append(_dense_search(query_vector, kb, _DENSE_POOL_SIZE, where))
+    ranked_lists.append(_bm25_search(query_text, kb, _BM25_POOL_SIZE, where))
+
+    # Extra passes for each transformation variant (rewrite,
+    # paraphrases, sub-queries). Each contributes its own dense + BM25
+    # ranked lists to the RRF fusion. We deliberately re-embed here
+    # rather than requiring the caller to precompute vectors, because
+    # the caller is often the CLI/UI which shouldn't need to know
+    # about variant vector shapes. Extra embed cost is small (~10ms
+    # per variant on CPU) compared to the LLM answer step.
+    extra_variants = [
+        v for v in (variants or [])
+        if v and v.strip() and v.strip().lower() != query_text.strip().lower()
+    ]
+    if extra_variants:
+        variant_vectors = embed_texts(extra_variants)
+        for variant_text, variant_vector in zip(extra_variants, variant_vectors):
+            ranked_lists.append(_dense_search(variant_vector, kb, _DENSE_POOL_SIZE, where))
+            ranked_lists.append(_bm25_search(variant_text, kb, _BM25_POOL_SIZE, where))
+
+    # HyDE: dense-only extra pass using the embedding of a synthesized
+    # hypothetical answer paragraph. Skipped when empty/trivial - a
+    # one-word "hyde" would just noise up the fusion.
+    if hyde_answer and len(hyde_answer.strip()) > 10:
+        hyde_vector = embed_texts([hyde_answer])[0]
+        ranked_lists.append(_dense_search(hyde_vector, kb, _DENSE_POOL_SIZE, where))
+
+    # Keywords: BM25-only extra pass using the space-joined keyword
+    # bag. Sparse retrieval loves exact rare terms and doesn't care
+    # about grammar - this is where "PR number 12345" style lookups
+    # actually get boosted into the shortlist.
+    if keywords:
+        kw_query = " ".join(k for k in keywords if k and k.strip())
+        if kw_query.strip():
+            ranked_lists.append(_bm25_search(kw_query, kb, _BM25_POOL_SIZE, where))
+
+    # Parent-child retrieval always uses the primary query vector: the
+    # child index is a sentence-window index whose value is a precise
+    # semantic match against the actual user question, not a bag of
+    # paraphrases which would just muddy the child ranking.
     parent_child_hits: list[dict] = []
     if kb in _PARENT_CHILD_KBS:
         parent_child_hits = _parent_child_search(
@@ -572,8 +635,8 @@ def retrieve_hybrid(
         ranked_lists.append(parent_child_hits)
 
     logger.info(
-        "Hybrid (kb=%s): dense=%d bm25=%d parent_child=%d candidates before fusion",
-        kb, len(dense_hits), len(bm25_hits), len(parent_child_hits),
+        "Hybrid (kb=%s): %d ranked lists entering RRF fusion",
+        kb, len(ranked_lists),
     )
 
     fused = _reciprocal_rank_fusion(ranked_lists)

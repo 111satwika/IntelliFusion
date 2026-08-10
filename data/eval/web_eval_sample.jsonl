@@ -1,0 +1,25 @@
+# Starter evaluation dataset for the web KB (IBM Targetprocess dev-hub).
+# One JSON object per line. Lines starting with '#' or blank lines are
+# ignored by the loader (see app/evaluation/dataset.py).
+#
+# Required field:      question
+# Optional fields:     kb, expected_answer, expected_document_ids,
+#                      expected_chunk_ids, notes
+#
+# Ground-truth document_ids were selected by URL slug match; the pages
+# themselves are 226 unique docs under www.ibm.com/docs/en/targetprocess.
+# Feel free to add expected_chunk_ids by inspecting the retrieved chunks
+# from a real run (a stricter test than document-level hit rate).
+{"question": "How do I assign a User Story's Feature to a Bug?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=targetprocess-assign-user-storys-feature-bug"], "notes": "Direct-match page from the automation-rule library."}
+{"question": "What does the Assignables API do and what entities does it cover?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=reference-assignables-api"], "notes": "API reference page."}
+{"question": "How do I authenticate with the Targetprocess REST API?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=v1-authentication"]}
+{"question": "What response formats does the v1 API support (XML vs JSON)?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=v1-response-formats"]}
+{"question": "How do I create a new entity using CRUD operations?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=crud-create", "https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=v1-operations-crud"]}
+{"question": "How do I upload attachments through the API?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=crud-upload-attachments"]}
+{"question": "How does paging work when fetching large result sets?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=v1-paging"]}
+{"question": "How do I filter and sort resource collections in the API?", "kb": "web", "expected_document_ids": ["https://www.ibm.com/docs/en/targetprocess/tp-dev-hub/saas?topic=v1-sorting-filters"]}
+# Two open-ended questions with NO ground truth - exercise the LLM-judge
+# metrics (faithfulness / answer-relevance / context-relevance) without
+# requiring per-item labels. Good sanity check for the pipeline.
+{"question": "What is the difference between a User Story and a Feature in Targetprocess?", "kb": "web", "notes": "Concept question; retrieval ground truth omitted intentionally."}
+{"question": "How can I set up an automation rule to inherit a Portfolio Epic from an Epic's Features?", "kb": "web", "notes": "Automation-rule how-to; open-ended."}

@@ -68,31 +68,47 @@ Design:
 """
 
 import logging
+import os
 from pathlib import Path
 
 import requests
+from PIL import Image
 
 from app.chunking.parent_child import chunk_with_parent_child
+from app.embeddings.audio_embedder import embed_audio_clips
 from app.embeddings.embedder import EmbeddedChunk, embed_chunks, embed_texts
 from app.embeddings.image_embedder import download_image, embed_images
-from app.generation.llm_generator import generate_vision_text
+from app.graph.code_graph import build_repository_graph, save_repository_graph
 from app.ingestion.loader import (
     Document,
+    _DEFAULT_FRAME_INTERVAL_SECONDS,
+    _DEFAULT_MAX_FRAMES,
+    _parse_github_repo_url,
+    _sample_audio_clips,
+    _sample_video_frames,
+    _video_duration_seconds,
     crawl_website,
     extract_image_records,
+    load_audio_document,
     load_docx_document,
+    load_github_discussions,
+    load_github_issues,
+    load_github_pull_requests,
     load_github_repository,
     load_markdown_document,
     load_pdf_document,
+    load_video_document,
     load_website_document,
 )
-from app.ocr.image_classifier import CODE, classify_extracted_text
-from app.ocr.image_ocr import combine_ocr_and_vision, extract_text_from_image
-from app.ocr.prompts import CODE_EXTRACTION_PROMPT
+from app.media import media_store
+from app.ocr.frame_analysis import analyze_frame
+from app.ocr.image_classifier import CODE
 from app.vectorstore.store import (
     _iter_collections,
+    add_audio_clip_chunks,
     add_embedded_chunks,
     add_image_chunks,
+    audio_clip_count,
     count,
     image_count,
 )
@@ -102,10 +118,28 @@ logger = logging.getLogger(__name__)
 DATA_RAW_DIR = str(Path(__file__).resolve().parent.parent.parent / "data" / "raw")
 URLS_FILE = str(Path(__file__).resolve().parent.parent.parent / "data" / "urls.txt")
 
+# Opt-in (default off): unlike video-frame CLIP embedding (always-on -
+# see _ingest_video_frames), audio CLAP embedding is a brand-new heavy
+# model that shouldn't silently start downloading a large checkpoint
+# and adding per-file ingestion cost for every existing deployment the
+# moment this ships. Read at import time, matching WHISPER_MODEL_SIZE's
+# precedent in app.ingestion.loader.
+_ENABLE_AUDIO_SIMILARITY_SEARCH = os.environ.get("ENABLE_AUDIO_SIMILARITY_SEARCH", "") == "1"
+
 _LOADERS_BY_EXTENSION = {
     ".md": load_markdown_document,
     ".pdf": load_pdf_document,
     ".docx": load_docx_document,
+    ".mp3": load_audio_document,
+    ".wav": load_audio_document,
+    ".m4a": load_audio_document,
+    ".flac": load_audio_document,
+    ".ogg": load_audio_document,
+    ".mp4": load_video_document,
+    ".mov": load_video_document,
+    ".mkv": load_video_document,
+    ".avi": load_video_document,
+    ".webm": load_video_document,
 }
 
 
@@ -240,30 +274,15 @@ def _ingest_images(document: Document) -> int:
          retrieval/generation need). This closes the "the code exists
          on the page but only as a picture" gap.
 
-    Text extraction is a two-stage pipeline per image:
-      a. Traditional OCR (see app.ocr.image_ocr.extract_text_from_image)
-         always runs first - cheap, and usually good enough for plain
-         screenshots/diagrams with a little text.
-      b. The OCR'd text is then classified (see
-         app.ocr.image_classifier.classify_extracted_text) as CODE or
-         OTHER, based on whether it looks like source code. ONLY for
-         images classified CODE, a local vision model (llava) is ALSO
-         run, using a strict, transcription-only extraction prompt
-         (app.ocr.prompts.CODE_EXTRACTION_PROMPT - deliberately not a
-         generic "describe this image" question, which would invite the
-         model to explain/infer/"correct" the code instead of
-         transcribing it exactly). The two outputs are then combined
-         (see app.ocr.image_ocr.combine_ocr_and_vision) into one final
-         block of extracted content, rather than trusting either engine
-         alone.
-    Gating the (expensive, CPU-bound, tens-of-seconds-per-image) vision
-    call to CODE-classified images only keeps ingestion runtime roughly
-    proportional to how much actual code exists in the corpus, instead
-    of multiplying every single image's cost - while still directly
-    targeting the exact problem this pipeline exists to solve (code
-    rendered only as a screenshot). A vision call that fails/times out
-    is logged and skipped (falls back to OCR-only text for that image)
-    rather than failing the whole document's ingestion.
+    Text extraction per image is delegated to
+    app.ocr.frame_analysis.analyze_frame() - the same OCR-first,
+    vision-only-for-CODE-classified-images pipeline used to be inline
+    here, extracted into its own module so app.ingestion.loader's
+    video ingestion (sampled frames have no Document/webpage/CLIP
+    context to hang this logic off of) can reuse the identical gate
+    instead of a second, independently-drifting copy. See that
+    module's docstring for exactly why each stage exists (OCR-first,
+    the CODE-only vision gate, combining both engines' output).
 
     A no-op (returns 0) for any Document with no image markers, which
     today is every non-web Document - so calling this for every source
@@ -330,7 +349,17 @@ def _ingest_images(document: Document) -> int:
         {
             "content": records_by_url[url]["alt_text"],
             "embedding": embedding,
-            "metadata": records_by_url[url],
+            # "origin"/"source_kb" written explicitly (not left
+            # implicit) so metadata.get("origin", "web_image") is a
+            # safe read pattern for every consumer of the image
+            # collection, now that video frames (see
+            # _ingest_video_frames) can also land in it with
+            # origin="video_frame". source_kb is what
+            # app.retrieval.retriever.retrieve_images filters by so a
+            # question scoped to one KB tab doesn't match images from
+            # a completely different source (see that function's
+            # docstring for why this matters).
+            "metadata": {**records_by_url[url], "origin": "web_image", "source_kb": "web"},
         }
         for url, embedding in zip(valid_urls, embeddings)
     ]
@@ -340,27 +369,19 @@ def _ingest_images(document: Document) -> int:
     code_image_count = 0
     for url in valid_urls:
         image = images_by_url[url]
-        ocr_text = extract_text_from_image(image)
-        image_type = classify_extracted_text(ocr_text)
-
-        final_text = ocr_text
-        if image_type == CODE:
+        analysis = analyze_frame(image)
+        final_text = analysis.text
+        if analysis.image_type == CODE:
             code_image_count += 1
-            try:
-                vision_text = generate_vision_text(image, CODE_EXTRACTION_PROMPT)
-            except Exception as error:
-                logger.warning("Vision extraction failed for '%s' (keeping OCR-only text): %s", url, error)
-                vision_text = ""
-            final_text = combine_ocr_and_vision(ocr_text, vision_text)
 
         if not final_text:
             continue
 
         record = records_by_url[url]
-        content_type = "image_code" if image_type == CODE else "image_ocr"
+        content_type = "image_code" if analysis.image_type == CODE else "image_ocr"
         extracted_chunks.append(
             EmbeddedChunk(
-                content=f"[Text extracted from image ({image_type}): {record['alt_text']}]\n{final_text}",
+                content=f"[Text extracted from image ({analysis.image_type}): {record['alt_text']}]\n{final_text}",
                 embedding=[],
                 metadata={
                     "document_id": url,
@@ -371,6 +392,17 @@ def _ingest_images(document: Document) -> int:
                     "content_type": content_type,
                     "image_url": url,
                     "source_type": "web",
+                    # This chunk bypasses chunk_with_parent_child (it's
+                    # a standalone OCR/vision extraction, not part of a
+                    # parent/child pair), but app.retrieval.hybrid_
+                    # retriever's dense search and BM25 index for the
+                    # "web"/"github" KBs both hard-filter to
+                    # chunk_role="parent" - without this field, these
+                    # chunks were silently excluded from both retrieval
+                    # legs despite being stored. "parent" is correct
+                    # here: this chunk is complete/standalone, exactly
+                    # what that filter is meant to admit.
+                    "chunk_role": "parent",
                 },
             )
         )
@@ -396,6 +428,159 @@ def _ingest_images(document: Document) -> int:
         )
 
     return len(image_chunks)
+
+
+def _ingest_video_frames(document: Document, file_path: str) -> int:
+    """
+    Embed every sampled frame of a video with CLIP (visual similarity
+    search - see app.embeddings.image_embedder), storing each into the
+    SAME image collection website images already use
+    (app.vectorstore.store.add_image_chunks) - a video frame is just
+    an image in that same vector space, so a second collection would
+    only fragment search for no benefit (see
+    app.embeddings.audio_embedder's module docstring for why AUDIO, by
+    contrast, needs a genuinely separate collection).
+
+    This is a SEPARATE pass from load_video_document's own frame
+    sampling (which extracts on-screen TEXT via OCR/vision, already
+    merged into `document.content`) - re-decoding the video a second
+    time here is a deliberate, accepted tradeoff (see the "native
+    embeddings" plan) rather than threading CLIP embedding through the
+    text-extraction loader path and blurring the loader/ingest
+    boundary every other source type (including images) already
+    respects: loader.py only ever decodes, ingest.py is uniformly
+    where embed_*/add_*_chunks calls happen.
+
+    Always runs (not gated by an env var) - the OCR/vision frame-text
+    step this pass duplicates the decode of is ALREADY unconditional
+    and far more expensive per frame (see app.ocr.frame_analysis), so
+    gating only the comparatively cheap CLIP embedding step here would
+    be an inconsistent half-measure.
+
+    Frames have no real external URL the way a web image does - each
+    sampled frame is saved as a small JPEG thumbnail
+    (app.media.media_store.save_frame_thumbnail) and THAT servable
+    "/media/frames/..." URL is what gets stored as image_url (still
+    add_image_chunks()'s upsert id, unchanged).
+
+    Returns:
+        How many frames were embedded and stored.
+    """
+    document_id = document.metadata.get("document_id")
+    duration = _video_duration_seconds(file_path)
+    interval = _DEFAULT_FRAME_INTERVAL_SECONDS
+    if duration and _DEFAULT_MAX_FRAMES:
+        interval = max(_DEFAULT_FRAME_INTERVAL_SECONDS, duration / _DEFAULT_MAX_FRAMES)
+
+    timestamps: list[float] = []
+    frames: list[Image.Image] = []
+    for timestamp, frame in _sample_video_frames(file_path, interval, duration):
+        timestamps.append(timestamp)
+        frames.append(frame)
+
+    if not frames:
+        return 0
+
+    embeddings = embed_images(frames)
+
+    image_chunks = []
+    for timestamp, frame, embedding in zip(timestamps, frames, embeddings):
+        thumbnail_url = media_store.save_frame_thumbnail(document_id, timestamp, frame)
+        image_chunks.append(
+            {
+                "content": f"Frame from {document_id} at {_format_timestamp_label(timestamp)}",
+                "embedding": embedding,
+                "metadata": {
+                    "image_url": thumbnail_url,
+                    "alt_text": f"Frame from {document_id} at {_format_timestamp_label(timestamp)}",
+                    "origin": "video_frame",
+                    "video_document_id": document_id,
+                    "timestamp_seconds": timestamp,
+                    # See app.retrieval.retriever.retrieve_images's
+                    # docstring - this is what a per-KB "video" chat
+                    # scopes on, so frames from a different KB (there
+                    # is none today, but source_kb is the general
+                    # mechanism) or web images never leak in.
+                    "source_kb": "video",
+                },
+            }
+        )
+
+    add_image_chunks(image_chunks)
+    logger.info("Embedded and stored %d video frame(s) for CLIP visual search from '%s'", len(image_chunks), document_id)
+    return len(image_chunks)
+
+
+def _format_timestamp_label(seconds: float) -> str:
+    """"MM:SS" - mirrors loader.py's own _format_timestamp, duplicated
+    here rather than imported since it's a private helper of that
+    module and this is a display-only label, not a parsed value."""
+    total_seconds = int(seconds)
+    minutes, secs = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _ingest_audio_clips(document: Document, file_path: str) -> int:
+    """
+    Embed every sampled 10s window of an audio/video file's audio
+    track with CLAP (acoustic similarity search - see
+    app.embeddings.audio_embedder), storing into the genuinely
+    separate rag_audio_clip_chunks collection (unlike video frames,
+    audio has no existing embedding space to reuse - CLAP's vector
+    space has nothing in common with CLIP's or MiniLM's).
+
+    No-op (returns 0, does no work at all - not even sampling) unless
+    ENABLE_AUDIO_SIMILARITY_SEARCH=1 - see that flag's own comment for
+    why this path is opt-in while video-frame CLIP embedding isn't.
+
+    Saves ONE full copy of the source file (app.media.media_store.save_media_copy)
+    per document, not one file per embedded clip - every clip hit
+    references that same file plus its own start_seconds/end_seconds,
+    and the UI seeks into it for playback rather than needing ~dozens
+    of tiny per-clip audio files on disk.
+
+    Returns:
+        How many clips were embedded and stored.
+    """
+    if not _ENABLE_AUDIO_SIMILARITY_SEARCH:
+        return 0
+
+    document_id = document.metadata.get("document_id")
+    clips = list(_sample_audio_clips(file_path))
+    if not clips:
+        return 0
+
+    starts = [start for start, _end, _waveform in clips]
+    ends = [end for _start, end, _waveform in clips]
+    waveforms = [waveform for _start, _end, waveform in clips]
+
+    embeddings = embed_audio_clips(waveforms)
+    source_url = media_store.save_media_copy(document_id, file_path)
+
+    clip_chunks = [
+        {
+            "content": f"Clip from {document_id} at {_format_timestamp_label(start)}",
+            "embedding": embedding,
+            "metadata": {
+                "document_id": document_id,
+                "start_seconds": start,
+                "end_seconds": end,
+                "source_audio_url": source_url,
+                # "audio" or "video" (document.metadata["source_type"] -
+                # the file this clip's audio track came from). What
+                # app.retrieval.retriever.retrieve_audio_clips filters
+                # by so a question scoped to one KB tab doesn't surface
+                # a clip from a completely different ingested file -
+                # see that function's docstring for why this matters.
+                "source_kb": document.metadata.get("source_type"),
+            },
+        }
+        for start, end, embedding in zip(starts, ends, embeddings)
+    ]
+
+    add_audio_clip_chunks(clip_chunks)
+    logger.info("Embedded and stored %d audio clip(s) for CLAP acoustic search from '%s'", len(clip_chunks), document_id)
+    return len(clip_chunks)
 
 
 def ingest_all(
@@ -437,21 +622,35 @@ def ingest_all(
 
     total_chunks = 0
     total_images = 0
+    total_audio_clips = 0
     for document in documents:
         chunks = chunk_with_parent_child(document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         embedded_chunks = embed_chunks(chunks)
         add_embedded_chunks(embedded_chunks)
         total_chunks += len(chunks)
         total_images += _ingest_images(document)
+        # Native visual/acoustic similarity search (see
+        # _ingest_video_frames/_ingest_audio_clips) - file_path is
+        # already set by load_video_document/load_audio_document
+        # themselves, so no extra path-tracking is needed here. Both
+        # "audio" and "video" source types have an audio track to
+        # sample for CLAP.
+        source_type = document.metadata.get("source_type")
+        if source_type == "video":
+            total_images += _ingest_video_frames(document, document.metadata["file_path"])
+        if source_type in ("audio", "video"):
+            total_audio_clips += _ingest_audio_clips(document, document.metadata["file_path"])
 
     logger.info(
-        "Ingestion complete: stored %d chunk(s) and %d image(s) total across %d "
-        "document(s)/page(s). Collection now has %d chunk(s), %d image(s).",
+        "Ingestion complete: stored %d chunk(s), %d image(s), %d audio clip(s) total across %d "
+        "document(s)/page(s). Collection now has %d chunk(s), %d image(s), %d audio clip(s).",
         total_chunks,
         total_images,
+        total_audio_clips,
         len(documents),
         count(),
         image_count(),
+        audio_clip_count(),
     )
     return total_chunks
 
@@ -509,6 +708,26 @@ def ingest_github_repo(
         add_embedded_chunks(embedded_chunks)
         total_chunks += len(chunks)
 
+    # Build the per-repo GraphRAG code graph AFTER chunks are stored:
+    # this way a graph on disk always corresponds to a repository
+    # actually present in the vector store, so
+    # app.graph.graph_retrieval never traverses to a document_id that
+    # has no chunks behind it. Reuses the exact same Documents (with
+    # their file_path/repository metadata) that just got chunked, so
+    # graph nodes and chunk metadata stay in lockstep. Non-Python
+    # files are silently skipped by build_repository_graph itself
+    # (see its docstring).
+    if documents:
+        repository = documents[0].metadata.get("repository")
+        if repository:
+            file_pairs = [
+                (doc.metadata["file_path"], doc.content)
+                for doc in documents
+                if doc.metadata.get("file_path")
+            ]
+            graph = build_repository_graph(repository, file_pairs)
+            save_repository_graph(graph, repository)
+
     logger.info(
         "GitHub ingestion complete for '%s': stored %d chunk(s) across %d file(s). "
         "Collection now has %d chunk(s).",
@@ -518,6 +737,93 @@ def ingest_github_repo(
         count(),
     )
     return total_chunks
+
+
+def ingest_github_activity(
+    repo_url: str,
+    include_issues: bool = True,
+    include_prs: bool = True,
+    include_discussions: bool = True,
+    max_items: int = 200,
+) -> dict:
+    """
+    Ingest a repository's Issues, Pull Requests, and/or Discussions -
+    the conversational counterpart to ingest_github_repo() (which
+    ingests source/doc FILES). Each kind lands in the same "github" KB
+    as the repo's code (see app.ingestion.loader.load_github_issues/
+    load_github_pull_requests/load_github_discussions - all three use
+    source_type="code" so app.vectorstore.store routes them there,
+    distinguished from code chunks and from each other via
+    content_type="issue"/"pull_request"/"discussion"), so a question
+    like "what issues mention the login bug" is answered from the same
+    hybrid retrieval path as any other GitHub-KB question, with zero
+    changes needed to retrieval/routing.
+
+    Every kind is independently toggleable because Discussions require
+    a GITHUB_TOKEN (see load_github_discussions) while issues/PRs work
+    token-optionally - a caller without a token can still ingest
+    issues/PRs by leaving include_discussions=False.
+
+    Re-running this for the same repo is safe/idempotent for the same
+    reason as ingest_github_repo(): each Document's document_id
+    ("owner/repo:issue:<n>" etc.) makes chunk ids stable, so
+    re-ingesting overwrites the same chunks instead of duplicating
+    them. Deletion is also already covered for free:
+    app.vectorstore.store.delete_repository() removes every chunk
+    matching the `repository` metadata field regardless of
+    content_type, so deleting a repo already removes its issues/PRs/
+    discussions along with its code.
+
+    Args:
+        repo_url: A GitHub repo reference (see
+            app.ingestion.loader._parse_github_repo_url for accepted
+            forms).
+        include_issues, include_prs, include_discussions: Which kinds
+            to fetch and ingest.
+        max_items: Cap on how many of EACH kind to fetch (passed
+            through as max_items to each loader).
+
+    Returns:
+        {"repository": "owner/repo", "issues": N, "pull_requests": N,
+        "discussions": N, "chunks": total_chunks_stored} - counts are
+        0 for any kind that was left disabled.
+    """
+    owner, repo, _branch = _parse_github_repo_url(repo_url)
+    repository = f"{owner}/{repo}"
+
+    counts = {"issues": 0, "pull_requests": 0, "discussions": 0}
+    total_chunks = 0
+
+    if include_issues:
+        documents = load_github_issues(owner, repo, max_items=max_items)
+        counts["issues"] = len(documents)
+        for document in documents:
+            chunks = chunk_with_parent_child(document)
+            add_embedded_chunks(embed_chunks(chunks))
+            total_chunks += len(chunks)
+
+    if include_prs:
+        documents = load_github_pull_requests(owner, repo, max_items=max_items)
+        counts["pull_requests"] = len(documents)
+        for document in documents:
+            chunks = chunk_with_parent_child(document)
+            add_embedded_chunks(embed_chunks(chunks))
+            total_chunks += len(chunks)
+
+    if include_discussions:
+        documents = load_github_discussions(owner, repo, max_items=max_items)
+        counts["discussions"] = len(documents)
+        for document in documents:
+            chunks = chunk_with_parent_child(document)
+            add_embedded_chunks(embed_chunks(chunks))
+            total_chunks += len(chunks)
+
+    logger.info(
+        "GitHub activity ingestion complete for '%s': %d issue(s), %d PR(s), %d discussion(s), "
+        "%d chunk(s) stored.",
+        repository, counts["issues"], counts["pull_requests"], counts["discussions"], total_chunks,
+    )
+    return {"repository": repository, **counts, "chunks": total_chunks}
 
 
 if __name__ == "__main__":
