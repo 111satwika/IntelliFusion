@@ -208,3 +208,51 @@ def test_semantic_kb_scoring_treats_empty_sample_as_zero_score(monkeypatch):
 
     assert all(score == 0.0 for score in scores.values())
 
+
+def test_a_dominant_kb_excludes_weaker_kbs_that_only_cleared_the_floor(monkeypatch):
+    # Reproduces the real "what is automation rule" case: web scored
+    # ~0.46 while markdown/docx/github all cleared the 0.2 absolute
+    # floor by coincidence (~0.2-0.3) without being genuine contenders.
+    # docx here scores 0.3 - comfortably above the 0.2 floor on its
+    # own, but well below 70% of web's 1.0 - so it should be dropped
+    # from .kbs even though .kb_scores still reports it. embed_texts is
+    # monkeypatched too so the query vector is a known [1.0, 0.0],
+    # matching what classify_route() actually feeds into _semantic_kbs
+    # (unlike test_semantic_kb_scoring_* above, which call _semantic_kbs
+    # directly and can pass a controlled vector without this step).
+    monkeypatch.setattr(router, "embed_texts", lambda texts: [[1.0, 0.0]])
+
+    def fake_sample(kb, limit=40):
+        if kb == "web":
+            return [[1.0, 0.0]]
+        if kb == "docx":
+            return [[0.3, 0.9539392014169456]]  # cosine(query, this) == 0.3
+        return []
+
+    monkeypatch.setattr(router, "sample_kb_embeddings", fake_sample)
+
+    decision = classify_route("what is automation rule")
+
+    assert decision.kbs == ["web"]
+    assert decision.kb_scores["docx"] == pytest.approx(0.3, abs=0.01)
+
+
+def test_close_contenders_are_both_kept(monkeypatch):
+    # github scores 0.85 against web's 1.0 - well within the 70%
+    # relative margin, so both are genuine contenders and neither
+    # should be dropped.
+    monkeypatch.setattr(router, "embed_texts", lambda texts: [[1.0, 0.0]])
+
+    def fake_sample(kb, limit=40):
+        if kb == "web":
+            return [[1.0, 0.0]]
+        if kb == "github":
+            return [[0.85, 0.5268046013283738]]  # cosine(query, this) == 0.85
+        return []
+
+    monkeypatch.setattr(router, "sample_kb_embeddings", fake_sample)
+
+    decision = classify_route("what is automation rule")
+
+    assert set(decision.kbs) == {"web", "github"}
+

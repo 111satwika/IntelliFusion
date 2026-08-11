@@ -90,6 +90,17 @@ deliberately "pure"); the sample is small (default 40 chunks) and
 cached per KB, invalidated by app.vectorstore.store whenever that KB's
 chunks change (see invalidate_kb_routing_cache below), so the cost is
 one-time per KB per ingest/delete, not per query.
+
+A KB only makes it into `.kbs` if it clears BOTH an absolute floor
+(_SEMANTIC_KB_THRESHOLD) AND a relative margin against whichever KB
+scored highest (_SEMANTIC_KB_RELATIVE_MARGIN) - the floor alone let
+through KBs that happened to cluster just above it even when a
+different KB was the obvious, much stronger match (see
+_SEMANTIC_KB_RELATIVE_MARGIN's own comment for the real example that
+motivated this). `.kb_scores` always reports the raw, unfiltered score
+for every KB regardless of which ones made it into `.kbs` - so the
+observability data always shows the full picture even when the actual
+search narrowed to one KB.
 """
 
 import logging
@@ -281,6 +292,19 @@ _KB_SAMPLE_SIZE = 40
 # samples).
 _SEMANTIC_KB_THRESHOLD = 0.2
 
+# A flat absolute floor alone isn't enough: real usage showed a query
+# ("what is automation rule") scoring web=0.46 (clearly the right KB)
+# while markdown/docx/github all happened to cluster at 0.20-0.22 -
+# comfortably clearing the same 0.2 floor despite being nowhere near as
+# confident a match, so all four KBs got searched instead of just the
+# one that actually mattered. This margin adds a SECOND, relative cut:
+# once at least one KB clears the absolute floor, any other KB also
+# needs to score within this fraction of the best score to stay in the
+# running. A close race (e.g. 0.46 vs 0.40) still keeps both KBs - this
+# only drops KBs that cleared the floor by coincidence, not genuine
+# multi-KB contenders.
+_SEMANTIC_KB_RELATIVE_MARGIN = 0.7
+
 _kb_sample_embeddings_cache: dict[str, list[list[float]]] | None = None
 
 
@@ -416,7 +440,14 @@ def classify_route(query_text: str) -> RouteDecision:
 
     rule_kbs = _rule_based_kbs(query_text)
     kb_scores = _semantic_kbs(query_vector)
-    semantic_kbs = {kb for kb, score in kb_scores.items() if score >= _SEMANTIC_KB_THRESHOLD}
+    kbs_above_floor = {kb: score for kb, score in kb_scores.items() if score >= _SEMANTIC_KB_THRESHOLD}
+    if kbs_above_floor:
+        best_kb_score = max(kbs_above_floor.values())
+        semantic_kbs = {
+            kb for kb, score in kbs_above_floor.items() if score >= best_kb_score * _SEMANTIC_KB_RELATIVE_MARGIN
+        }
+    else:
+        semantic_kbs = set()
     kbs = sorted(rule_kbs | semantic_kbs)
 
     if not matched_routes:

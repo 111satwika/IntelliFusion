@@ -4,6 +4,11 @@ __pycache__/
 .venv/
 venv/
 
+# TLS private keys/certs (e.g. `tailscale cert` writes these into the
+# current directory by default - never commit private key material).
+*.key
+*.crt
+
 # Test / tool caches
 .pytest_cache/
 .mypy_cache/
@@ -17,3 +22,4 @@ data/graphs/
 data/media/
 data/*.log
 data/pending_documents.json
+data/pending_documents.json.lock
