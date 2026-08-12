@@ -125,7 +125,16 @@ class _BM25Index:
         self.tokenized_corpus = tokenized_corpus
 
 
-_bm25_index_by_kb: dict[str, _BM25Index | None] = {}
+# Keyed by (owner, kb), NOT just kb - see _build_bm25_index's docstring
+# for why. Fixing this key shape closed the highest-severity finding
+# from the per-user-privacy design review: an owner-unaware cache here
+# would hold every owner's raw chunk TEXT in shared process memory
+# regardless of which owner's query triggered the build, with
+# owner-safety depending entirely on every future caller remembering
+# to pass the right `where` at search time - unlike Chroma's own
+# .query(where=...), which filters server-side before a single byte of
+# a non-matching chunk ever leaves the database.
+_bm25_index_by_owner_kb: dict[tuple[str, str], _BM25Index | None] = {}
 
 
 def _bm25_tokenize(text: str) -> list[str]:
@@ -137,9 +146,16 @@ def _bm25_tokenize(text: str) -> list[str]:
     return [word for word in re.findall(r"[a-z0-9]+", text.lower()) if len(word) > 1]
 
 
-def _build_bm25_index(kb: str) -> _BM25Index | None:
-    """Fetch every chunk in the KB and build a fresh BM25 index over
-    them. Returns None if the KB is empty (no chunks to index yet).
+def _build_bm25_index(kb: str, owner: str) -> _BM25Index | None:
+    """Fetch every chunk THIS OWNER has in the KB and build a fresh
+    BM25 index over them. Returns None if this owner has no chunks in
+    the KB yet.
+
+    Owner-scoped at fetch time (where={"owner": owner}), not just at
+    search time - the whole point is that another owner's raw chunk
+    text never enters this process's memory in the first place, not
+    just that it gets filtered back out before being returned (see
+    _bm25_index_by_owner_kb's comment for why that distinction matters).
 
     For parent-child KBs (see _PARENT_CHILD_KBS), only PARENT chunks
     are indexed - children are sentence fragments meant only for the
@@ -148,12 +164,12 @@ def _build_bm25_index(kb: str) -> _BM25Index | None:
     once in each child slice).
     """
     collection = _get_collection(kb)
+    owner_clause = {"owner": owner}
     if kb in _PARENT_CHILD_KBS:
-        result = collection.get(
-            where={"chunk_role": "parent"}, include=["documents", "metadatas"]
-        )
+        where = {"$and": [{"chunk_role": "parent"}, owner_clause]}
     else:
-        result = collection.get(include=["documents", "metadatas"])
+        where = owner_clause
+    result = collection.get(where=where, include=["documents", "metadatas"])
     documents = result.get("documents") or []
     metadatas = result.get("metadatas") or []
     if not documents:
@@ -161,30 +177,44 @@ def _build_bm25_index(kb: str) -> _BM25Index | None:
 
     tokenized_corpus = [_bm25_tokenize(doc) for doc in documents]
     bm25 = BM25Okapi(tokenized_corpus)
-    logger.info("Built BM25 index for KB '%s' over %d chunk(s)", kb, len(documents))
+    logger.info("Built BM25 index for KB '%s' (owner=%r) over %d chunk(s)", kb, owner, len(documents))
     return _BM25Index(documents, metadatas, bm25, tokenized_corpus)
 
 
-def _get_bm25_index(kb: str) -> _BM25Index | None:
-    """Return the cached BM25 index for kb, building it if absent.
-    Returns None if the KB has no chunks."""
-    if kb not in _bm25_index_by_kb:
-        _bm25_index_by_kb[kb] = _build_bm25_index(kb)
-    return _bm25_index_by_kb[kb]
+def _get_bm25_index(kb: str, owner: str) -> _BM25Index | None:
+    """Return the cached BM25 index for (owner, kb), building it if
+    absent. Returns None if this owner has no chunks in the KB."""
+    key = (owner, kb)
+    if key not in _bm25_index_by_owner_kb:
+        _bm25_index_by_owner_kb[key] = _build_bm25_index(kb, owner)
+    return _bm25_index_by_owner_kb[key]
 
 
-def invalidate_bm25_cache(kb: str | None = None) -> None:
-    """Drop the cached BM25 index so the next query rebuilds it.
+def invalidate_bm25_cache(kb: str | None = None, owner: str | None = None) -> None:
+    """Drop cached BM25 index/indices so the next query rebuilds them.
 
     Called from the vectorstore's ingest / delete paths whenever the
-    underlying chunks change. Passing None invalidates every cached
-    KB (used by the delete-all-KBs paths).
+    underlying chunks change - those call sites know which `kb` changed
+    but NOT which owner(s) currently have a cached index for it (that's
+    an internal detail of this module), so:
+      - kb=None: invalidate every cached (owner, kb) pair (used by the
+        delete-all-KBs paths).
+      - kb given, owner=None (the common case from store.py's ingest/
+        delete callers): sweep every cached entry for that kb,
+        regardless of which owner it belonged to - simplest correct
+        behavior without requiring every existing call site to learn
+        which owner(s) were actually affected.
+      - both given: drop just that one (owner, kb) entry.
     """
-    global _bm25_index_by_kb
+    global _bm25_index_by_owner_kb
     if kb is None:
-        _bm25_index_by_kb = {}
+        _bm25_index_by_owner_kb = {}
+    elif owner is None:
+        _bm25_index_by_owner_kb = {
+            key: index for key, index in _bm25_index_by_owner_kb.items() if key[1] != kb
+        }
     else:
-        _bm25_index_by_kb.pop(kb, None)
+        _bm25_index_by_owner_kb.pop((owner, kb), None)
 
 
 # ---- Cross-encoder (module-cached) -----------------------------------
@@ -238,11 +268,13 @@ def _add_parent_role_filter(where: dict | None, kb: str) -> dict | None:
     return {"$and": [where, role_clause]}
 
 
-def _bm25_search(query_text: str, kb: str, top_k: int, where: dict | None) -> list[dict]:
+def _bm25_search(query_text: str, kb: str, top_k: int, where: dict | None, owner: str) -> list[dict]:
     """Rank chunks by BM25 score against the query, optionally filtered
     by metadata (repository, content_type, etc.) to keep BM25's results
-    consistent with the dense retriever's where-filter behavior."""
-    index = _get_bm25_index(kb)
+    consistent with the dense retriever's where-filter behavior. owner
+    selects which (owner, kb) cached index to search - see
+    _build_bm25_index."""
+    index = _get_bm25_index(kb, owner)
     if index is None:
         return []
 
@@ -286,7 +318,7 @@ def _bm25_search(query_text: str, kb: str, top_k: int, where: dict | None) -> li
 
 
 def _parent_child_search(
-    query_vector: list[float], kb: str, top_k: int, where: dict | None
+    query_vector: list[float], kb: str, top_k: int, where: dict | None, owner: str
 ) -> list[dict]:
     """
     Sentence-window / "small-to-big" retrieval.
@@ -338,7 +370,7 @@ def _parent_child_search(
     if not parent_keys:
         return []
 
-    parents = _fetch_parents(kb, parent_keys)
+    parents = _fetch_parents(kb, parent_keys, owner)
     if not parents:
         return []
 
@@ -379,7 +411,7 @@ def _combine_where(base: dict | None, extra: dict) -> dict:
     return {"$and": [base, extra]}
 
 
-def _fetch_parents(kb: str, parent_keys: list[tuple]) -> dict[tuple, dict]:
+def _fetch_parents(kb: str, parent_keys: list[tuple], owner: str) -> dict[tuple, dict]:
     """
     Look up parent chunks by their (document_id, chunk_index) keys.
 
@@ -387,6 +419,10 @@ def _fetch_parents(kb: str, parent_keys: list[tuple]) -> dict[tuple, dict]:
     document_id when possible, then indexes results into a dict keyed
     on (document_id, chunk_index) so the caller can retrieve each
     parent in O(1) regardless of which child triggered the lookup.
+    owner is checked redundantly here (independent of whatever
+    where-filter the child search that produced these keys already
+    applied) - defense in depth, not relying solely on "the caller
+    already filtered" for a lookup this direct.
 
     Silently skips (returns nothing for) any parent key that no
     matching chunk exists for - possible if a child's parent was
@@ -398,8 +434,8 @@ def _fetch_parents(kb: str, parent_keys: list[tuple]) -> dict[tuple, dict]:
 
     collection = _get_collection(kb)
     # One get() per distinct document_id keeps the where filter simple:
-    # document_id + chunk_role="parent" filters down to a per-document
-    # parent list, then we index by chunk_index in Python.
+    # document_id + chunk_role="parent" + owner filters down to a
+    # per-document parent list, then we index by chunk_index in Python.
     document_ids = {doc_id for doc_id, _ in parent_keys}
     parents_by_key: dict[tuple, dict] = {}
     for doc_id in document_ids:
@@ -408,6 +444,7 @@ def _fetch_parents(kb: str, parent_keys: list[tuple]) -> dict[tuple, dict]:
                 "$and": [
                     {"document_id": doc_id},
                     {"chunk_role": "parent"},
+                    {"owner": owner},
                 ]
             },
             include=["documents", "metadatas"],
@@ -531,6 +568,7 @@ def retrieve_hybrid(
     query_vector: list[float],
     kb: str,
     top_k: int,
+    owner: str,
     where: dict | None = None,
     variants: list[str] | None = None,
     hyde_answer: str | None = None,
@@ -541,6 +579,14 @@ def retrieve_hybrid(
     it) → RRF → cross-encoder rerank → top_k.
 
     Args:
+        owner: Selects which owner's BM25 index (see
+            _build_bm25_index) and parent-lookup results are used -
+            required, not optional, since an owner-unaware BM25 build
+            would load every owner's raw chunk text into shared
+            process memory (see _bm25_index_by_owner_kb's comment).
+            Dense search gets its own owner scoping for free via
+            `where` (the caller is expected to have already folded an
+            owner clause into it), same as any other where-clause.
         query_text: The raw query string (needed for BM25 tokenization
             and the cross-encoder, which both consume text).
         query_vector: The query's embedding (needed for dense search).
@@ -588,7 +634,7 @@ def retrieve_hybrid(
 
     # Primary pass: original query text with the pre-embedded vector.
     ranked_lists.append(_dense_search(query_vector, kb, _DENSE_POOL_SIZE, where))
-    ranked_lists.append(_bm25_search(query_text, kb, _BM25_POOL_SIZE, where))
+    ranked_lists.append(_bm25_search(query_text, kb, _BM25_POOL_SIZE, where, owner))
 
     # Extra passes for each transformation variant (rewrite,
     # paraphrases, sub-queries). Each contributes its own dense + BM25
@@ -605,7 +651,7 @@ def retrieve_hybrid(
         variant_vectors = embed_texts(extra_variants)
         for variant_text, variant_vector in zip(extra_variants, variant_vectors):
             ranked_lists.append(_dense_search(variant_vector, kb, _DENSE_POOL_SIZE, where))
-            ranked_lists.append(_bm25_search(variant_text, kb, _BM25_POOL_SIZE, where))
+            ranked_lists.append(_bm25_search(variant_text, kb, _BM25_POOL_SIZE, where, owner))
 
     # HyDE: dense-only extra pass using the embedding of a synthesized
     # hypothetical answer paragraph. Skipped when empty/trivial - a
@@ -621,7 +667,7 @@ def retrieve_hybrid(
     if keywords:
         kw_query = " ".join(k for k in keywords if k and k.strip())
         if kw_query.strip():
-            ranked_lists.append(_bm25_search(kw_query, kb, _BM25_POOL_SIZE, where))
+            ranked_lists.append(_bm25_search(kw_query, kb, _BM25_POOL_SIZE, where, owner))
 
     # Parent-child retrieval always uses the primary query vector: the
     # child index is a sentence-window index whose value is a precise
@@ -630,7 +676,7 @@ def retrieve_hybrid(
     parent_child_hits: list[dict] = []
     if kb in _PARENT_CHILD_KBS:
         parent_child_hits = _parent_child_search(
-            query_vector, kb, _PARENT_CHILD_POOL_SIZE, where
+            query_vector, kb, _PARENT_CHILD_POOL_SIZE, where, owner
         )
         ranked_lists.append(parent_child_hits)
 
@@ -657,8 +703,9 @@ def retrieve_pdf_hybrid(
     query_text: str,
     query_vector: list[float],
     top_k: int,
+    owner: str,
     where: dict | None = None,
 ) -> list[dict]:
     """Kept for callers that still hard-code "pdf"; new callers should
     use retrieve_hybrid(kb=...) directly."""
-    return retrieve_hybrid(query_text, query_vector, kb="pdf", top_k=top_k, where=where)
+    return retrieve_hybrid(query_text, query_vector, kb="pdf", top_k=top_k, owner=owner, where=where)

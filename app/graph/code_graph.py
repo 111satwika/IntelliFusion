@@ -75,15 +75,20 @@ EDGE_INHERITS = "inherits"    # class -> base-class-name
 EDGE_KINDS = (EDGE_CONTAINS, EDGE_IMPORTS, EDGE_CALLS, EDGE_INHERITS)
 
 
-def _graph_path(repository: str) -> Path:
+def _graph_path(owner: str, repository: str) -> Path:
     """Filesystem path for a repository's pickled graph.
 
-    "owner/repo" has a slash; the on-disk name uses '__' so it's a
-    valid single filename on Windows/Linux/macOS without needing
-    nested directories.
+    Namespaced under a per-account-owner subdirectory (not to be
+    confused with `repository`'s own "owner/repo" GitHub owner) so two
+    different local accounts that each ingest a repository of the same
+    name get fully independent graphs - one account's structural
+    ("who calls X") queries must never traverse a graph another
+    account privately built. "owner/repo" has a slash; the on-disk
+    name uses '__' so it's a valid single filename on Windows/Linux/
+    macOS without needing further nesting.
     """
     safe = repository.replace("/", "__")
-    return _GRAPH_DIR / f"{safe}.gpickle"
+    return _GRAPH_DIR / owner / f"{safe}.gpickle"
 
 
 def _file_node(repository: str, file_path: str) -> str:
@@ -352,28 +357,28 @@ def build_repository_graph(
     return graph
 
 
-def save_repository_graph(graph: nx.MultiDiGraph, repository: str) -> Path:
-    """Persist a repository's graph to data/graphs/. Creates the
-    directory if needed. Returns the path written."""
-    _GRAPH_DIR.mkdir(parents=True, exist_ok=True)
-    path = _graph_path(repository)
+def save_repository_graph(graph: nx.MultiDiGraph, repository: str, owner: str) -> Path:
+    """Persist a repository's graph to data/graphs/{owner}/. Creates
+    the directory if needed. Returns the path written."""
+    path = _graph_path(owner, repository)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as handle:
         pickle.dump(graph, handle)
-    logger.info("Saved graph for '%s' -> %s", repository, path)
+    logger.info("Saved graph for '%s' (owner=%r) -> %s", repository, owner, path)
     return path
 
 
-def load_repository_graph(repository: str) -> nx.MultiDiGraph | None:
+def load_repository_graph(repository: str, owner: str) -> nx.MultiDiGraph | None:
     """
     Load a repository's graph from disk, or None if it hasn't been
-    built yet.
+    built yet (by this owner).
 
     Returning None (rather than raising) is deliberate: the caller in
     graph_retrieval treats absence as "fall back to hybrid", which is
     the same behavior as an empty result - the user still gets an
     answer, just without the structural boost.
     """
-    path = _graph_path(repository)
+    path = _graph_path(owner, repository)
     if not path.exists():
         return None
     try:

@@ -206,7 +206,7 @@ def _walk(
     return neighbors
 
 
-def _nodes_to_chunks(graph: nx.MultiDiGraph, node_ids: list[str]) -> list[dict]:
+def _nodes_to_chunks(graph: nx.MultiDiGraph, node_ids: list[str], owner: str) -> list[dict]:
     """
     Turn graph nodes back into Chroma chunks.
 
@@ -216,7 +216,12 @@ def _nodes_to_chunks(graph: nx.MultiDiGraph, node_ids: list[str]) -> list[dict]:
     - the parent class chunk, its per-method children, and any
     module-level leftover - and let the cross-encoder rerank them by
     textual relevance. External nodes have no chunk to fetch and are
-    silently skipped: the reranker sees only real repo content.
+    silently skipped: the reranker sees only real repo content. owner
+    is checked alongside document_id (the graph itself is already
+    loaded from an owner-namespaced file - see code_graph._graph_path
+    - but this chunk lookup is independently scoped too, defense in
+    depth rather than relying solely on the caller having loaded the
+    right graph).
 
     Deduplicated by document_id so many nodes in the same file don't
     each pull the same chunks multiple times.
@@ -234,7 +239,7 @@ def _nodes_to_chunks(graph: nx.MultiDiGraph, node_ids: list[str]) -> list[dict]:
             continue
         seen_documents.add(document_id)
 
-        result = collection.get(where={"document_id": document_id})
+        result = collection.get(where={"$and": [{"document_id": document_id}, {"owner": owner}]})
         for chunk_id, content, metadata in zip(
             result["ids"], result["documents"], result["metadatas"]
         ):
@@ -257,6 +262,7 @@ def retrieve_by_graph(
     query_text: str,
     symbol_name: str,
     repository: str,
+    owner: str,
 ) -> list[dict]:
     """
     Full graph-retrieval path: load graph -> find seeds -> walk in
@@ -279,6 +285,11 @@ def retrieve_by_graph(
             load. Required - a graph without a repo scope is
             meaningless (a symbol like "run" could match dozens
             of repos).
+        owner: Local account that ingested this repository - selects
+            which owner-namespaced graph file to load (see
+            code_graph._graph_path) so one account's structural
+            queries can never traverse a graph a different account
+            privately built for a same-named repository.
 
     Returns:
         A list of chunk dicts in the standard retrieve() shape (id,
@@ -286,7 +297,7 @@ def retrieve_by_graph(
         reranked - the caller is responsible for rerank + top_k
         selection so the same reranker settings are used everywhere.
     """
-    graph = load_repository_graph(repository)
+    graph = load_repository_graph(repository, owner)
     if graph is None:
         logger.info(
             "No graph on disk for '%s' - structural retrieval falling back.", repository
@@ -310,7 +321,7 @@ def retrieve_by_graph(
         for edge_kind, direction in directions:
             touched.extend(_walk(graph, seed, edge_kind, direction))
 
-    hits = _nodes_to_chunks(graph, touched)
+    hits = _nodes_to_chunks(graph, touched, owner)
     logger.info(
         "Structural retrieval for symbol=%r on '%s': %d seed(s), %d touched node(s), %d chunk(s).",
         symbol_name,

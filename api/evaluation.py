@@ -12,13 +12,14 @@ to disk (data/eval/reports/) regardless.
 
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from app.evaluation.dataset import load_dataset
 from app.evaluation.report import write_report
 from app.evaluation.runner import EvalConfig, run_evaluation
 
+from api.deps import get_current_user
 from jobs import start_job
 
 router = APIRouter(prefix="/api/evaluation", tags=["evaluation"])
@@ -69,7 +70,7 @@ def _serialize_report(report) -> dict:
     }
 
 
-def _run_evaluation_job(body: RunRequest, *, progress):
+def _run_evaluation_job(body: RunRequest, owner: str, *, progress):
     global _last_report_serialized
 
     items = load_dataset(Path(body.dataset_path))
@@ -86,7 +87,7 @@ def _run_evaluation_job(body: RunRequest, *, progress):
     def _progress_cb(idx, total, item):
         progress({"index": idx, "total": total, "question": item.question[:80]})
 
-    report = run_evaluation(items, config, progress_callback=_progress_cb)
+    report = run_evaluation(items, config, owner=owner, progress_callback=_progress_cb)
     md_path, json_path = write_report(report, _EVAL_REPORTS_DIR, name=body.report_name or "eval")
 
     serialized = _serialize_report(report)
@@ -97,8 +98,8 @@ def _run_evaluation_job(body: RunRequest, *, progress):
 
 
 @router.post("/run")
-def run(body: RunRequest):
-    job_id = start_job(_run_evaluation_job, body)
+def run(body: RunRequest, owner: str = Depends(get_current_user)):
+    job_id = start_job(_run_evaluation_job, body, owner)
     return {"job_id": job_id}
 
 

@@ -32,66 +32,66 @@ def test_disabled_by_default_never_hits_even_with_a_perfect_match():
     # to prove a lookup against that existing, perfectly-matching entry
     # still misses.
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
     semantic_cache.set_enabled(False)
 
-    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None, "local")
 
     assert result is None
 
 
 def test_store_answer_is_a_noop_while_disabled():
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
     semantic_cache.set_enabled(True)
-    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None, "local")
 
     assert result is None  # nothing was ever actually stored
 
 
 def test_hit_when_both_similarity_and_overlap_pass():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("original question", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("original question", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
-    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None, "local")
 
     assert result == "cached answer"
 
 
 def test_miss_on_kb_mismatch_even_with_perfect_similarity_and_overlap():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
-    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "github", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "github", None, "local")
 
     assert result is None
 
 
 def test_miss_on_repository_mismatch_even_with_perfect_similarity_and_overlap():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "github", "owner/repo-a", "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "github", "owner/repo-a", "cached answer", "local")
 
-    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "github", "owner/repo-b")
+    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "github", "owner/repo-b", "local")
 
     assert result is None
 
 
 def test_miss_when_question_similarity_is_low_even_with_full_chunk_overlap():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
     # Orthogonal vector -> cosine similarity 0.0, well below threshold.
-    result = semantic_cache.find_cached_answer([0.0, 1.0], _CHUNKS_A, "web", None)
+    result = semantic_cache.find_cached_answer([0.0, 1.0], _CHUNKS_A, "web", None, "local")
 
     assert result is None
 
 
 def test_miss_when_chunk_overlap_is_low_even_with_perfect_question_similarity():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
     unrelated_chunks = [_chunk("doc2", 0, "Something about a completely different topic.")]
-    result = semantic_cache.find_cached_answer([1.0, 0.0], unrelated_chunks, "web", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], unrelated_chunks, "web", None, "local")
 
     assert result is None
 
@@ -102,45 +102,45 @@ def test_content_hash_invalidates_a_stale_id_match():
     # docstring: chunk identity folds in a content hash specifically so
     # a stale id-only match can't serve outdated evidence as current.
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
     edited_chunks = [_chunk("doc1", 0, "This content has been completely rewritten since caching.")]
-    result = semantic_cache.find_cached_answer([1.0, 0.0], edited_chunks, "web", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], edited_chunks, "web", None, "local")
 
     assert result is None
 
 
 def test_empty_chunks_on_lookup_returns_none_without_error():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
-    result = semantic_cache.find_cached_answer([1.0, 0.0], [], "web", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], [], "web", None, "local")
 
     assert result is None
 
 
 def test_store_answer_noops_on_empty_answer():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "", "local")
 
-    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None, "local")
 
     assert result is None
 
 
 def test_store_answer_noops_on_empty_chunks():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], [], "web", None, "an answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], [], "web", None, "an answer", "local")
 
     assert len(semantic_cache._cache) == 0
 
 
 def test_enabled_override_takes_precedence_over_module_flag():
     semantic_cache.set_enabled(True)
-    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer")
+    semantic_cache.store_answer("q", [1.0, 0.0], _CHUNKS_A, "web", None, "cached answer", "local")
 
     # Module flag is ON, but an explicit enabled=False override must win.
-    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None, enabled=False)
+    result = semantic_cache.find_cached_answer([1.0, 0.0], _CHUNKS_A, "web", None, "local", enabled=False)
 
     assert result is None
 
@@ -151,7 +151,7 @@ def test_fifo_eviction_beyond_maxsize(monkeypatch):
 
     for i in range(3):
         chunks = [_chunk(f"doc{i}", 0, f"unique content number {i}")]
-        semantic_cache.store_answer(f"q{i}", [1.0, 0.0], chunks, "web", None, f"answer {i}")
+        semantic_cache.store_answer(f"q{i}", [1.0, 0.0], chunks, "web", None, f"answer {i}", "local")
 
     # The first entry (doc0) should have been evicted; the last two remain.
     assert len(semantic_cache._cache) == 2

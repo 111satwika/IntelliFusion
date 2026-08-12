@@ -16,10 +16,10 @@ from app.retrieval import hybrid_retriever
 def _reset_module_caches():
     """Every test starts from a clean cache slate so one test's cached
     BM25 index or cross-encoder can't leak into another's setup."""
-    hybrid_retriever._bm25_index_by_kb = {}
+    hybrid_retriever._bm25_index_by_owner_kb = {}
     hybrid_retriever._cross_encoder = None
     yield
-    hybrid_retriever._bm25_index_by_kb = {}
+    hybrid_retriever._bm25_index_by_owner_kb = {}
     hybrid_retriever._cross_encoder = None
 
 
@@ -157,13 +157,13 @@ def test_matches_where_none_is_always_true():
 # ---- _bm25_search ----------------------------------------------------
 
 
-def _prime_bm25_index(monkeypatch, contents, metadatas):
+def _prime_bm25_index(monkeypatch, contents, metadatas, owner="local"):
     """Bypass the real collection.get() call by stuffing a prebuilt
     BM25 index into the module-level cache."""
     from rank_bm25 import BM25Okapi
     tokenized = [hybrid_retriever._bm25_tokenize(doc) for doc in contents]
     index = hybrid_retriever._BM25Index(contents, metadatas, BM25Okapi(tokenized), tokenized)
-    hybrid_retriever._bm25_index_by_kb["pdf"] = index
+    hybrid_retriever._bm25_index_by_owner_kb[(owner, "pdf")] = index
 
 
 def test_bm25_search_ranks_by_term_frequency(monkeypatch):
@@ -178,10 +178,10 @@ def test_bm25_search_ranks_by_term_frequency(monkeypatch):
         ],
         metadatas=[{"document_id": "a", "chunk_index": 0}] * 3,
     )
-    for i, m in enumerate(hybrid_retriever._bm25_index_by_kb["pdf"].metadatas):
+    for i, m in enumerate(hybrid_retriever._bm25_index_by_owner_kb[("local", "pdf")].metadatas):
         m["chunk_index"] = i
 
-    hits = hybrid_retriever._bm25_search("revenue", kb="pdf", top_k=3, where=None)
+    hits = hybrid_retriever._bm25_search("revenue", kb="pdf", top_k=3, where=None, owner="local")
     assert hits[0]["content"].startswith("revenue revenue revenue")
 
 
@@ -197,7 +197,7 @@ def test_bm25_search_skips_zero_score_docs(monkeypatch):
         metadatas=[{"document_id": "a", "chunk_index": 0}, {"document_id": "b", "chunk_index": 0}],
     )
 
-    hits = hybrid_retriever._bm25_search("revenue", kb="pdf", top_k=5, where=None)
+    hits = hybrid_retriever._bm25_search("revenue", kb="pdf", top_k=5, where=None, owner="local")
     document_ids = [h["metadata"]["document_id"] for h in hits]
     assert "a" in document_ids
     assert "b" not in document_ids
@@ -217,7 +217,7 @@ def test_bm25_search_honors_where_filter(monkeypatch):
     )
 
     hits = hybrid_retriever._bm25_search(
-        "revenue", kb="pdf", top_k=5, where={"repository": "owner/foo"}
+        "revenue", kb="pdf", top_k=5, where={"repository": "owner/foo"}, owner="local"
     )
     assert [h["metadata"]["repository"] for h in hits] == ["owner/foo"]
 
@@ -225,25 +225,35 @@ def test_bm25_search_honors_where_filter(monkeypatch):
 def test_bm25_search_returns_empty_when_index_missing(monkeypatch):
     """No chunks yet → BM25 build returns None → search short-circuits
     to []."""
-    monkeypatch.setattr(hybrid_retriever, "_build_bm25_index", lambda kb: None)
-    hits = hybrid_retriever._bm25_search("anything", kb="pdf", top_k=5, where=None)
+    monkeypatch.setattr(hybrid_retriever, "_build_bm25_index", lambda kb, owner: None)
+    hits = hybrid_retriever._bm25_search("anything", kb="pdf", top_k=5, where=None, owner="local")
     assert hits == []
 
 
 # ---- invalidate_bm25_cache -------------------------------------------
 
 
-def test_invalidate_bm25_cache_drops_specific_kb():
-    hybrid_retriever._bm25_index_by_kb = {"pdf": "sentinel", "docx": "keep"}
+def test_invalidate_bm25_cache_drops_specific_kb_for_all_owners():
+    hybrid_retriever._bm25_index_by_owner_kb = {
+        ("local", "pdf"): "sentinel", ("alice", "pdf"): "sentinel2", ("local", "docx"): "keep"
+    }
     hybrid_retriever.invalidate_bm25_cache("pdf")
-    assert "pdf" not in hybrid_retriever._bm25_index_by_kb
-    assert hybrid_retriever._bm25_index_by_kb.get("docx") == "keep"
+    assert ("local", "pdf") not in hybrid_retriever._bm25_index_by_owner_kb
+    assert ("alice", "pdf") not in hybrid_retriever._bm25_index_by_owner_kb
+    assert hybrid_retriever._bm25_index_by_owner_kb.get(("local", "docx")) == "keep"
+
+
+def test_invalidate_bm25_cache_specific_owner_and_kb():
+    hybrid_retriever._bm25_index_by_owner_kb = {("local", "pdf"): "a", ("alice", "pdf"): "b"}
+    hybrid_retriever.invalidate_bm25_cache("pdf", owner="local")
+    assert ("local", "pdf") not in hybrid_retriever._bm25_index_by_owner_kb
+    assert hybrid_retriever._bm25_index_by_owner_kb.get(("alice", "pdf")) == "b"
 
 
 def test_invalidate_bm25_cache_none_drops_everything():
-    hybrid_retriever._bm25_index_by_kb = {"pdf": "a", "docx": "b"}
+    hybrid_retriever._bm25_index_by_owner_kb = {("local", "pdf"): "a", ("local", "docx"): "b"}
     hybrid_retriever.invalidate_bm25_cache(None)
-    assert hybrid_retriever._bm25_index_by_kb == {}
+    assert hybrid_retriever._bm25_index_by_owner_kb == {}
 
 
 # ---- retrieve_pdf_hybrid (end-to-end wiring) ------------------------
@@ -261,7 +271,7 @@ def test_retrieve_pdf_hybrid_runs_all_three_stages(monkeypatch):
             {"content": "dense-b", "metadata": {"document_id": "b", "chunk_index": 0}},
         ]
 
-    def fake_bm25(query_text, kb, top_k, where):
+    def fake_bm25(query_text, kb, top_k, where, owner):
         calls["bm25"] += 1
         return [
             {"content": "bm25-b", "metadata": {"document_id": "b", "chunk_index": 0}},
@@ -284,6 +294,7 @@ def test_retrieve_pdf_hybrid_runs_all_three_stages(monkeypatch):
         "b query",
         query_vector=[0.1, 0.2, 0.3],
         top_k=2,
+        owner="local",
         where=None,
     )
 
@@ -312,7 +323,7 @@ def test_retrieve_pdf_hybrid_respects_top_k(monkeypatch):
     monkeypatch.setattr(hybrid_retriever, "_get_cross_encoder", lambda: FakeCE())
 
     results = hybrid_retriever.retrieve_pdf_hybrid(
-        "query", query_vector=[0.0], top_k=3, where=None
+        "query", query_vector=[0.0], top_k=3, owner="local", where=None
     )
     assert len(results) == 3
 
@@ -333,7 +344,7 @@ def test_retrieve_pdf_hybrid_handles_empty_kb(monkeypatch):
     monkeypatch.setattr(hybrid_retriever, "_get_cross_encoder", lambda: FakeCE())
 
     results = hybrid_retriever.retrieve_pdf_hybrid(
-        "query", query_vector=[0.0], top_k=5, where=None
+        "query", query_vector=[0.0], top_k=5, owner="local", where=None
     )
     assert results == []
     assert ce_called["n"] == 0
@@ -353,7 +364,7 @@ def test_retrieve_hybrid_supports_every_hybrid_kb(monkeypatch, kb):
         captured_kbs["dense"] = kb_arg
         return [{"content": "d", "metadata": {"document_id": "x", "chunk_index": 0}}]
 
-    def fake_bm25(query_text, kb_arg, top_k, where):
+    def fake_bm25(query_text, kb_arg, top_k, where, owner):
         captured_kbs["bm25"] = kb_arg
         return [{"content": "b", "metadata": {"document_id": "y", "chunk_index": 0}}]
 
@@ -366,7 +377,7 @@ def test_retrieve_hybrid_supports_every_hybrid_kb(monkeypatch, kb):
     monkeypatch.setattr(hybrid_retriever, "_get_cross_encoder", lambda: FakeCE())
 
     results = hybrid_retriever.retrieve_hybrid(
-        "q", query_vector=[0.0], kb=kb, top_k=5, where=None
+        "q", query_vector=[0.0], kb=kb, top_k=5, owner="local", where=None
     )
     assert captured_kbs == {"dense": kb, "bm25": kb}
     assert len(results) > 0
@@ -479,7 +490,7 @@ def test_parent_child_search_returns_empty_for_non_parent_child_kb(monkeypatch):
 
     monkeypatch.setattr(hybrid_retriever, "query_embedding", unexpected)
     result = hybrid_retriever._parent_child_search(
-        [0.0], kb="pdf", top_k=10, where=None
+        [0.0], kb="pdf", top_k=10, where=None, owner="local"
     )
     assert result == []
 
@@ -545,7 +556,7 @@ def test_parent_child_search_dedupes_children_by_parent_index(monkeypatch):
     monkeypatch.setattr(hybrid_retriever, "_get_collection", lambda kb: FakeCollection())
 
     hits = hybrid_retriever._parent_child_search(
-        [0.0], kb="github", top_k=10, where=None
+        [0.0], kb="github", top_k=10, where=None, owner="local"
     )
 
     # Two unique parents from three child hits.
@@ -572,7 +583,7 @@ def test_parent_child_search_forwards_where_filter(monkeypatch):
 
     monkeypatch.setattr(hybrid_retriever, "query_embedding", fake_query_embedding)
     hybrid_retriever._parent_child_search(
-        [0.0], kb="web", top_k=10, where={"source_type": "web"}
+        [0.0], kb="web", top_k=10, where={"source_type": "web"}, owner="local"
     )
 
     assert captured["where"] == {
@@ -590,11 +601,11 @@ def test_retrieve_hybrid_fuses_three_lists_for_github(monkeypatch):
         calls["dense"] += 1
         return [{"content": "d", "metadata": {"document_id": "d1", "chunk_index": 0}}]
 
-    def fake_bm25(query_text, kb, top_k, where):
+    def fake_bm25(query_text, kb, top_k, where, owner):
         calls["bm25"] += 1
         return [{"content": "b", "metadata": {"document_id": "b1", "chunk_index": 0}}]
 
-    def fake_parent_child(query_vector, kb, top_k, where):
+    def fake_parent_child(query_vector, kb, top_k, where, owner):
         calls["parent_child"] += 1
         return [{"content": "pc", "metadata": {"document_id": "pc1", "chunk_index": 0}}]
 
@@ -615,7 +626,7 @@ def test_retrieve_hybrid_fuses_three_lists_for_github(monkeypatch):
     monkeypatch.setattr(hybrid_retriever, "_get_cross_encoder", lambda: FakeCE())
 
     hybrid_retriever.retrieve_hybrid(
-        "q", query_vector=[0.0], kb="github", top_k=5, where=None
+        "q", query_vector=[0.0], kb="github", top_k=5, owner="local", where=None
     )
 
     assert calls == {"dense": 1, "bm25": 1, "parent_child": 1}
@@ -655,7 +666,7 @@ def test_retrieve_hybrid_uses_two_lists_for_pdf(monkeypatch):
     monkeypatch.setattr(hybrid_retriever, "_get_cross_encoder", lambda: FakeCE())
 
     hybrid_retriever.retrieve_hybrid(
-        "q", query_vector=[0.0], kb="pdf", top_k=5, where=None
+        "q", query_vector=[0.0], kb="pdf", top_k=5, owner="local", where=None
     )
 
     assert called["parent_child"] == 0

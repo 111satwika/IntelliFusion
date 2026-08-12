@@ -105,14 +105,22 @@ def _images_referenced_in_chunks(chunks: list[dict]) -> list[dict]:
     return hits
 
 
-def ask(query_text: str, top_k: int = 3, repository: str | None = None) -> str:
+# Default owner for plain `python cli.py "question"` usage, which has
+# no login/account concept of its own - matches
+# app.vectorstore.store._DEFAULT_OWNER's value (duplicated as a plain
+# string rather than importing across layers; cli.py is meant to stay
+# usable standalone, without depending on api/deps.py's LOCAL_OWNER).
+_DEFAULT_OWNER = "local"
+
+
+def ask(query_text: str, top_k: int = 3, repository: str | None = None, owner: str = _DEFAULT_OWNER) -> str:
     """Run the full retrieve -> build_prompt -> generate_answer pipeline."""
-    chunks = retrieve(query_text, top_k=top_k, repository=repository)
+    chunks = retrieve(query_text, top_k=top_k, repository=repository, owner=owner)
     prompt = build_prompt(query_text, chunks)
     return generate_answer(prompt)
 
 
-def _is_code_screenshot(image_url: str) -> bool:
+def _is_code_screenshot(image_url: str, owner: str) -> bool:
     """
     True if the given image's own OCR/vision text chunk was classified
     as a source-code screenshot (content_type == "image_code") at
@@ -124,7 +132,7 @@ def _is_code_screenshot(image_url: str) -> bool:
     can be garbled/inaccurate), without paying the vision-model cost
     for every loosely CLIP-relevant image.
     """
-    chunk = get_chunk_by_document_id(image_url)
+    chunk = get_chunk_by_document_id(image_url, owner)
     return chunk is not None and chunk["metadata"].get("content_type") == "image_code"
 
 
@@ -143,6 +151,7 @@ def _apply_crag(
     top_k: int,
     repository: str | None,
     kb: str | None,
+    owner: str,
     crag_enabled: bool | None = None,
     query_transform_enabled: bool | None = None,
 ) -> tuple[list[dict], CragResult | None]:
@@ -199,12 +208,12 @@ def _apply_crag(
     try:
         if kb == "github":
             extra_chunks, _ = retrieve_github_adaptive(
-                rewritten, top_k=top_k, repository=repository,
+                rewritten, top_k=top_k, repository=repository, owner=owner,
                 query_transform_enabled=query_transform_enabled,
             )
         else:
             extra_chunks = retrieve(
-                rewritten, top_k=top_k, repository=repository, kb=kb,
+                rewritten, top_k=top_k, repository=repository, kb=kb, owner=owner,
                 query_transform_enabled=query_transform_enabled,
             )
     except Exception:  # noqa: BLE001 - re-retrieval failure just leaves us with the keepers
@@ -233,6 +242,7 @@ def ask_with_vision(
     repository: str | None = None,
     kb: str | None = None,
     *,
+    owner: str = _DEFAULT_OWNER,
     crag_enabled: bool | None = None,
     query_transform_enabled: bool | None = None,
     self_rag_enabled: bool | None = None,
@@ -288,7 +298,7 @@ def ask_with_vision(
     prompt, display_images, vision_image_urls, chunks, _crag, _contextualization, cached_answer, _audio_clip_hits = (
         _prepare_context_and_images(
             query_text, top_k=top_k, use_vision=use_vision, repository=repository, kb=kb,
-            crag_enabled=crag_enabled, query_transform_enabled=query_transform_enabled,
+            owner=owner, crag_enabled=crag_enabled, query_transform_enabled=query_transform_enabled,
             history=history, conversation_memory_enabled=conversation_memory_enabled,
         )
     )
@@ -315,7 +325,7 @@ def ask_with_vision(
             try:
                 question_embedding = embed_texts([_contextualization.resolved])[0]
                 semantic_cache.store_answer(
-                    _contextualization.resolved, question_embedding, chunks, kb, repository, answer
+                    _contextualization.resolved, question_embedding, chunks, kb, repository, answer, owner
                 )
             except Exception:  # noqa: BLE001 - cache store failure must not break the answer
                 logger.exception("Semantic cache store failed; continuing without caching this answer.")
@@ -342,6 +352,7 @@ def ask_with_vision_stream(
     repository: str | None = None,
     kb: str | None = None,
     *,
+    owner: str = _DEFAULT_OWNER,
     crag_enabled: bool | None = None,
     query_transform_enabled: bool | None = None,
     self_rag_enabled: bool | None = None,
@@ -402,7 +413,7 @@ def ask_with_vision_stream(
     prompt, display_images, vision_image_urls, chunks, crag_result, contextualization, cached_answer, audio_clip_hits = (
         _prepare_context_and_images(
             query_text, top_k=top_k, use_vision=use_vision, repository=repository, kb=kb,
-            crag_enabled=crag_enabled, query_transform_enabled=query_transform_enabled,
+            owner=owner, crag_enabled=crag_enabled, query_transform_enabled=query_transform_enabled,
             history=history, conversation_memory_enabled=conversation_memory_enabled,
         )
     )
@@ -432,7 +443,7 @@ def ask_with_vision_stream(
         try:
             question_embedding = embed_texts([contextualization.resolved])[0]
             semantic_cache.store_answer(
-                contextualization.resolved, question_embedding, chunks, kb, repository, answer
+                contextualization.resolved, question_embedding, chunks, kb, repository, answer, owner
             )
         except Exception:  # noqa: BLE001
             logger.exception("Semantic cache store failed; continuing without caching this answer.")
@@ -494,6 +505,7 @@ def _prepare_context_and_images(
     repository: str | None,
     kb: str | None,
     *,
+    owner: str = _DEFAULT_OWNER,
     crag_enabled: bool | None = None,
     query_transform_enabled: bool | None = None,
     history: list[dict] | None = None,
@@ -589,7 +601,7 @@ def _prepare_context_and_images(
     # unchanged, so this branch is purely additive.
     if kb == "github":
         chunks, github_intent = retrieve_github_adaptive(
-            resolved_query, top_k=top_k, repository=repository,
+            resolved_query, top_k=top_k, repository=repository, owner=owner,
             query_transform_enabled=query_transform_enabled,
         )
         logger.info(
@@ -599,7 +611,7 @@ def _prepare_context_and_images(
         )
     else:
         chunks = retrieve(
-            resolved_query, top_k=top_k, repository=repository, kb=kb,
+            resolved_query, top_k=top_k, repository=repository, kb=kb, owner=owner,
             query_transform_enabled=query_transform_enabled,
         )
 
@@ -610,7 +622,7 @@ def _prepare_context_and_images(
     # trivial "correct" result with every chunk kept, so this branch
     # is a no-op for users who haven't opted in.
     chunks, crag_result = _apply_crag(
-        resolved_query, chunks, top_k=top_k, repository=repository, kb=kb,
+        resolved_query, chunks, top_k=top_k, repository=repository, kb=kb, owner=owner,
         crag_enabled=crag_enabled, query_transform_enabled=query_transform_enabled,
     )
 
@@ -635,7 +647,7 @@ def _prepare_context_and_images(
             # from a completely different source (see
             # retrieve_images's own docstring). None (cross-KB chat)
             # searches every image regardless of origin, unchanged.
-            image_hits = retrieve_images(query_text, top_k=MAX_IMAGES_FOR_VISION, kb=kb)
+            image_hits = retrieve_images(query_text, top_k=MAX_IMAGES_FOR_VISION, kb=kb, owner=owner)
         except Exception:
             logger.exception("Image retrieval failed; continuing text-only.")
             image_hits = []
@@ -649,7 +661,7 @@ def _prepare_context_and_images(
     # to match against, so query_audio_clip_embedding just returns [].
     if "sound" in content_type_routes:
         try:
-            audio_clip_hits = retrieve_audio_clips(query_text, top_k=MAX_IMAGES_FOR_VISION, kb=kb)
+            audio_clip_hits = retrieve_audio_clips(query_text, top_k=MAX_IMAGES_FOR_VISION, kb=kb, owner=owner)
         except Exception:
             logger.exception("Audio clip retrieval failed; continuing without it.")
             audio_clip_hits = []
@@ -662,7 +674,7 @@ def _prepare_context_and_images(
         images_to_send = relevant_images
     else:
         images_to_send = [
-            hit for hit in relevant_images if _is_code_screenshot(hit["metadata"]["image_url"])
+            hit for hit in relevant_images if _is_code_screenshot(hit["metadata"]["image_url"], owner)
         ]
     vision_image_urls = [hit["metadata"]["image_url"] for hit in images_to_send]
 
@@ -695,7 +707,7 @@ def _prepare_context_and_images(
     if not history and not vision_image_urls and semantic_cache.is_enabled():
         try:
             question_embedding = embed_texts([contextualization.resolved])[0]
-            cached_answer = semantic_cache.find_cached_answer(question_embedding, chunks, kb, repository)
+            cached_answer = semantic_cache.find_cached_answer(question_embedding, chunks, kb, repository, owner)
         except Exception:  # noqa: BLE001 - cache lookup failure must not break the answer
             logger.exception("Semantic cache lookup failed; continuing without it.")
 

@@ -114,6 +114,12 @@ class SemanticCacheEntry:
     kb: str | None
     repository: str | None
     answer: str
+    owner: str  # closes a narrow cross-user gap: without this, two owners
+    # who happen to have ingested byte-identical content under the same
+    # document_id (e.g. both scrape the same public URL) could match
+    # each other's cache entries via the (kb, repository) + chunk-overlap
+    # checks alone - explicit owner scoping removes that edge case
+    # entirely rather than relying on it being emergently rare.
 
 
 def set_enabled(enabled: bool) -> None:
@@ -136,6 +142,7 @@ def find_cached_answer(
     chunks: list[dict],
     kb: str | None,
     repository: str | None,
+    owner: str,
     *,
     enabled: bool | None = None,
 ) -> str | None:
@@ -147,11 +154,15 @@ def find_cached_answer(
     (matches every other enable/disable toggle in this codebase);
     omit it to fall back to ``is_enabled()``.
 
-    Scoped to entries with an EXACT (kb, repository) match before any
-    fuzzy comparison runs - a question about one repo must never serve
-    an answer scoped to a different one. Among the remaining
-    candidates, returns the answer of whichever entry has the highest
-    question-similarity among those that clear BOTH thresholds.
+    Scoped to entries with an EXACT (kb, repository, owner) match
+    before any fuzzy comparison runs - a question about one repo must
+    never serve an answer scoped to a different one, and (as of the
+    owner field) one account must never serve an answer generated for
+    a different account, even if both happen to have ingested
+    identical content under the same kb/repository. Among the
+    remaining candidates, returns the answer of whichever entry has
+    the highest question-similarity among those that clear BOTH
+    thresholds.
     """
     effective_enabled = _enabled if enabled is None else enabled
     if not effective_enabled or not chunks or not _cache:
@@ -161,7 +172,7 @@ def find_cached_answer(
     best_score = -1.0
     best_answer: str | None = None
     for entry in _cache:
-        if entry.kb != kb or entry.repository != repository:
+        if entry.kb != kb or entry.repository != repository or entry.owner != owner:
             continue
         similarity = _cosine_similarity(question_embedding, entry.question_embedding)
         if similarity < _SIMILARITY_THRESHOLD:
@@ -182,6 +193,7 @@ def store_answer(
     kb: str | None,
     repository: str | None,
     answer: str,
+    owner: str,
 ) -> None:
     """
     Record a freshly-generated answer for future near-duplicate hits.
@@ -199,6 +211,7 @@ def store_answer(
         kb=kb,
         repository=repository,
         answer=answer,
+        owner=owner,
     )
     _cache.append(entry)
     while len(_cache) > _SEMANTIC_CACHE_MAXSIZE:

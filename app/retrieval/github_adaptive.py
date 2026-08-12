@@ -127,23 +127,21 @@ def _expand_hint_to_clause(hint_key: str, hint_value: str) -> dict:
     return {hint_key: hint_value}
 
 
-def _build_where(repository: str | None, extras: list[dict] | None = None) -> dict | None:
-    """Combine repository scope + any number of extra clauses into a
-    Chroma-style where filter under $and.
+def _build_where(owner: str, repository: str | None, extras: list[dict] | None = None) -> dict:
+    """Combine the owner scope (always present) + repository scope +
+    any number of extra clauses into a Chroma-style where filter under
+    $and.
 
     Every extra clause is applied as a conjunction: if the user names
     both a directory AND a language, retrieval is narrowed to chunks
-    matching BOTH. A single clause (or zero clauses, with no
-    repository) short-circuits the $and wrapper to keep filters
-    compact and readable in logs.
+    matching BOTH. A single clause short-circuits the $and wrapper to
+    keep filters compact and readable in logs.
     """
-    clauses: list[dict] = []
+    clauses: list[dict] = [{"owner": owner}]
     if repository:
         clauses.append({"repository": repository})
     if extras:
         clauses.extend(extras)
-    if not clauses:
-        return None
     if len(clauses) == 1:
         return clauses[0]
     return {"$and": clauses}
@@ -175,11 +173,14 @@ def _dense_then_rerank(
 
 
 def _bm25_then_rerank(
-    query_text: str, top_k: int, where: dict | None
+    query_text: str, top_k: int, where: dict | None, owner: str
 ) -> list[dict]:
     """BM25-only retrieval (over the github KB) + cross-encoder rerank.
-    Used by the exact_code branch."""
-    bm25_hits = _bm25_search(query_text, _KB, _INTENT_POOL_SIZE, where)
+    Used by the exact_code branch. owner selects which (owner, kb)
+    cached BM25 index is searched (see hybrid_retriever._build_bm25_index) -
+    independent of `where`, which only filters results after the index
+    is already built."""
+    bm25_hits = _bm25_search(query_text, _KB, _INTENT_POOL_SIZE, where, owner)
     if not bm25_hits:
         return []
     return _cross_encoder_rerank(query_text, bm25_hits, top_k)
@@ -190,6 +191,7 @@ def _run_hybrid(
     query_vector: list[float],
     top_k: int,
     where: dict | None,
+    owner: str,
     *,
     query_transform_enabled: bool | None = None,
 ) -> list[dict]:
@@ -208,7 +210,7 @@ def _run_hybrid(
     """
     transform = transform_query(query_text, kb=_KB, enabled=query_transform_enabled)
     return retrieve_hybrid(
-        query_text, query_vector, kb=_KB, top_k=top_k, where=where,
+        query_text, query_vector, kb=_KB, top_k=top_k, owner=owner, where=where,
         variants=transform.variants,
         hyde_answer=transform.hyde_answer,
         keywords=transform.keywords,
@@ -220,6 +222,7 @@ def retrieve_github_adaptive(
     top_k: int = 5,
     repository: str | None = None,
     *,
+    owner: str,
     query_transform_enabled: bool | None = None,
 ) -> tuple[list[dict], GitHubIntent]:
     """
@@ -267,8 +270,8 @@ def retrieve_github_adaptive(
     intent = decision.intent
     hint_fields = _INTENT_METADATA_FIELDS.get(intent, ())
     hint_clauses = _hints_to_clauses(decision.metadata_hints, hint_fields)
-    scoped_where = _build_where(repository, extras=hint_clauses)
-    unscoped_where = _build_where(repository)
+    scoped_where = _build_where(owner, repository, extras=hint_clauses)
+    unscoped_where = _build_where(owner, repository)
 
     # History is the one path that doesn't use the vector store at all:
     # commits live in git, not Chroma. If we can't or shouldn't call
@@ -288,7 +291,7 @@ def retrieve_github_adaptive(
             logger.info("Git history returned no commits - falling back to hybrid.")
         query_vector = embed_texts([query_text])[0]
         return _run_hybrid(
-            query_text, query_vector, top_k, unscoped_where,
+            query_text, query_vector, top_k, unscoped_where, owner,
             query_transform_enabled=query_transform_enabled,
         ), decision
 
@@ -298,7 +301,7 @@ def retrieve_github_adaptive(
         # means "restrict to issue/PR/discussion chunks", so the
         # filter is unconditional whenever this intent wins.
         activity_where = _build_where(
-            repository, extras=[{"content_type": {"$in": _ACTIVITY_CONTENT_TYPES}}]
+            owner, repository, extras=[{"content_type": {"$in": _ACTIVITY_CONTENT_TYPES}}]
         )
         query_vector = embed_texts([query_text])[0]
         hits = _dense_then_rerank(query_text, query_vector, top_k, activity_where)
@@ -310,7 +313,7 @@ def retrieve_github_adaptive(
             repository,
         )
         return _run_hybrid(
-            query_text, query_vector, top_k, unscoped_where,
+            query_text, query_vector, top_k, unscoped_where, owner,
             query_transform_enabled=query_transform_enabled,
         ), decision
 
@@ -338,7 +341,7 @@ def retrieve_github_adaptive(
         # returning nothing.
         symbol = decision.metadata_hints.get("symbol_name")
         if repository and symbol:
-            graph_hits = retrieve_by_graph(query_text, symbol, repository)
+            graph_hits = retrieve_by_graph(query_text, symbol, repository, owner)
             if graph_hits:
                 # Rerank the graph-materialized shortlist with the
                 # SAME cross-encoder every other branch uses, so the
@@ -358,23 +361,23 @@ def retrieve_github_adaptive(
         # by symbol_name if present) - it's the closest thing to
         # \"find the definition\" without a graph. If THAT is empty,
         # unfiltered hybrid is the last resort.
-        hits = _bm25_then_rerank(query_text, top_k, scoped_where) if hint_clauses else []
+        hits = _bm25_then_rerank(query_text, top_k, scoped_where, owner) if hint_clauses else []
         if hits:
             return hits, decision
         query_vector = embed_texts([query_text])[0]
         return _run_hybrid(
-            query_text, query_vector, top_k, unscoped_where,
+            query_text, query_vector, top_k, unscoped_where, owner,
             query_transform_enabled=query_transform_enabled,
         ), decision
 
     if intent == "exact_code":
-        hits = _bm25_then_rerank(query_text, top_k, scoped_where)
+        hits = _bm25_then_rerank(query_text, top_k, scoped_where, owner)
         if not hits and hint_clauses:
             logger.info(
                 "exact_code with metadata_hints=%r matched nothing - retrying without hints.",
                 decision.metadata_hints,
             )
-            hits = _bm25_then_rerank(query_text, top_k, unscoped_where)
+            hits = _bm25_then_rerank(query_text, top_k, unscoped_where, owner)
         return hits, decision
 
     if intent == "navigational" and hint_clauses:
@@ -392,7 +395,7 @@ def retrieve_github_adaptive(
             decision.metadata_hints,
         )
         return _run_hybrid(
-            query_text, query_vector, top_k, unscoped_where,
+            query_text, query_vector, top_k, unscoped_where, owner,
             query_transform_enabled=query_transform_enabled,
         ), decision
 
@@ -403,6 +406,6 @@ def retrieve_github_adaptive(
     # is just to produce the strongest text context possible.
     query_vector = embed_texts([query_text])[0]
     return _run_hybrid(
-        query_text, query_vector, top_k, unscoped_where,
+        query_text, query_vector, top_k, unscoped_where, owner,
         query_transform_enabled=query_transform_enabled,
     ), decision

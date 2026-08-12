@@ -23,3 +23,11 @@ data/media/
 data/*.log
 data/pending_documents.json
 data/pending_documents.json.lock
+
+# User account credentials (password hashes) - never commit these.
+data/users.json
+data/users.json.lock
+
+# One-off data/ backups made before running scripts/migrate_to_owner_scoping.py
+# (or similar) - machine-local safety copies, never meant to be committed.
+data_backup_*/

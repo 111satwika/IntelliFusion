@@ -36,17 +36,21 @@ if not auth.auth_enabled():
         "exposing this beyond your own machine. See DEPLOYMENT.md."
     )
 
-# Optional single-password gate (see api/auth.py + DEPLOYMENT.md) - a
-# no-op unless APP_PASSWORD is set, so plain local `uvicorn
-# server:app` usage and the test suite are unaffected. This is the
-# only middleware in the app; everything else is per-route Depends()
-# (see api/deps.py's get_session_id).
+# Optional per-user login gate (see api/auth.py + user_store.py +
+# DEPLOYMENT.md) - a no-op unless APP_PASSWORD is set (now just an
+# on/off switch - real per-account passwords live in user_store.json),
+# so plain local `uvicorn server:app` usage and the test suite are
+# unaffected. This is the only middleware in the app; everything else
+# is per-route Depends() (see api/deps.py's get_session_id/get_current_user).
+_UNAUTHENTICATED_PATHS = {"/login", "/signup"}
+
+
 @app.middleware("http")
 async def auth_gate(request: Request, call_next):
-    if not auth.auth_enabled() or request.url.path == "/login":
+    if not auth.auth_enabled() or request.url.path in _UNAUTHENTICATED_PATHS:
         return await call_next(request)
 
-    if auth.is_authenticated(request.cookies.get(auth.AUTH_COOKIE_NAME)):
+    if auth.get_authenticated_user(request.cookies.get(auth.AUTH_COOKIE_NAME)) is not None:
         return await call_next(request)
 
     if "text/html" in request.headers.get("accept", ""):

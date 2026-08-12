@@ -32,13 +32,14 @@ def test_activity_intent_filters_by_content_type(monkeypatch):
     monkeypatch.setattr(github_adaptive, "_cross_encoder_rerank", lambda q, hits, top_k: hits)
 
     chunks, decision = github_adaptive.retrieve_github_adaptive(
-        "what are the latest pull requests and issues", top_k=3, repository="owner/repo",
+        "what are the latest pull requests and issues", top_k=3, repository="owner/repo", owner="local",
     )
 
     assert decision.intent == "activity"
     assert len(chunks) == 1
     assert captured_where["where"] == {
         "$and": [
+            {"owner": "local"},
             {"repository": "owner/repo"},
             {"content_type": {"$in": ["issue", "pull_request", "discussion"]}},
         ]
@@ -52,14 +53,14 @@ def test_activity_intent_falls_back_to_hybrid_when_no_activity_chunks(monkeypatc
 
     hybrid_calls = []
 
-    def fake_run_hybrid(query_text, query_vector, top_k, where, *, query_transform_enabled=None):
+    def fake_run_hybrid(query_text, query_vector, top_k, where, owner, *, query_transform_enabled=None):
         hybrid_calls.append(where)
         return [{"content": "some code", "metadata": {}}]
 
     monkeypatch.setattr(github_adaptive, "_run_hybrid", fake_run_hybrid)
 
     chunks, decision = github_adaptive.retrieve_github_adaptive(
-        "what are the latest pull requests and issues", top_k=3, repository="owner/repo",
+        "what are the latest pull requests and issues", top_k=3, repository="owner/repo", owner="local",
     )
 
     assert len(hybrid_calls) == 1
@@ -81,9 +82,16 @@ def test_activity_intent_without_repository_still_filters_by_content_type(monkey
     monkeypatch.setattr(github_adaptive, "_dense_search", fake_dense_search)
     monkeypatch.setattr(github_adaptive, "_cross_encoder_rerank", lambda q, hits, top_k: hits)
 
-    github_adaptive.retrieve_github_adaptive("what pull requests are open", top_k=3, repository=None)
+    github_adaptive.retrieve_github_adaptive(
+        "what pull requests are open", top_k=3, repository=None, owner="local"
+    )
 
-    assert captured_where["where"] == {"content_type": {"$in": ["issue", "pull_request", "discussion"]}}
+    assert captured_where["where"] == {
+        "$and": [
+            {"owner": "local"},
+            {"content_type": {"$in": ["issue", "pull_request", "discussion"]}},
+        ]
+    }
 
 
 def test_non_activity_intent_is_unaffected(monkeypatch):
@@ -101,9 +109,9 @@ def test_non_activity_intent_is_unaffected(monkeypatch):
     monkeypatch.setattr(github_adaptive, "_cross_encoder_rerank", lambda q, hits, top_k: hits)
 
     chunks, decision = github_adaptive.retrieve_github_adaptive(
-        "how does the retry logic work", top_k=3, repository="owner/repo",
+        "how does the retry logic work", top_k=3, repository="owner/repo", owner="local",
     )
 
     assert decision.intent == "explanation"
     # No content_type filter leaked into an unrelated intent's where clause.
-    assert captured_where["where"] == {"repository": "owner/repo"}
+    assert captured_where["where"] == {"$and": [{"owner": "local"}, {"repository": "owner/repo"}]}

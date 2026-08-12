@@ -925,7 +925,26 @@ document.getElementById("source-chat-clear-btn").addEventListener("click", () =>
   clearChatThread(sourceChatThreadEl, state.activeType);
 });
 
+// ---------- Current user ----------
+async function loadCurrentUser() {
+  try {
+    const res = await fetch("/api/auth/me");
+    const data = await res.json();
+    const username = data.username || "?";
+    document.getElementById("rail-foot-avatar").textContent = username.charAt(0).toUpperCase();
+    document.getElementById("rail-foot-name").textContent = username;
+  } catch (err) {
+    document.getElementById("rail-foot-name").textContent = "Unknown";
+  }
+}
+
+document.getElementById("rail-foot-logout").addEventListener("click", async () => {
+  await fetch("/logout", { method: "POST" });
+  window.location.href = "/login";
+});
+
 // ---------- Initial load ----------
 document.querySelector('.type-card[data-type="markdown"]').classList.add("active");
 showSourceChatForType("markdown");
 pageLoaders.sources();
+loadCurrentUser();

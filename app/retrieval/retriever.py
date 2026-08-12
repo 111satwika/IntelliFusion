@@ -196,7 +196,7 @@ def _rerank_by_title_overlap(query_text: str, hits: list[dict], top_k: int) -> l
     return sorted(hits, key=score, reverse=True)[:top_k]
 
 
-def _complete_partial_tables(hits: list[dict]) -> list[dict]:
+def _complete_partial_tables(hits: list[dict], owner: str) -> list[dict]:
     """
     Replace any retrieved single-row table chunk with its complete
     whole-table chunk, so the LLM never sees an arbitrary subset of a
@@ -221,7 +221,7 @@ def _complete_partial_tables(hits: list[dict]) -> list[dict]:
         if metadata.get("content_type") == "table_row" and table_id:
             if table_id in seen_table_ids:
                 continue  # already represented by the complete table
-            full_table = get_table_chunk(table_id)
+            full_table = get_table_chunk(table_id, owner)
             if full_table is not None:
                 seen_table_ids.add(table_id)
                 completed.append(full_table)
@@ -232,28 +232,27 @@ def _complete_partial_tables(hits: list[dict]) -> list[dict]:
     return completed
 
 
-def _build_where(repository: str | None, content_types: list[str] | None) -> dict | None:
+def _build_where(owner: str, repository: str | None, content_types: list[str] | None) -> dict:
     """
-    Combine the repository scope (see retrieve()'s `repository` arg)
-    and a route's content_type restriction (see _ROUTE_CONTENT_TYPES)
-    into a single Chroma `where` filter, using `$and` only when both
-    are present (Chroma's where DSL wants an explicit boolean operator
-    for multi-condition filters, not an implicit AND via a plain
-    multi-key dict).
+    Combine the owner scope (always present - see retrieve()'s `owner`
+    arg), the repository scope (see retrieve()'s `repository` arg), and
+    a route's content_type restriction (see _ROUTE_CONTENT_TYPES) into
+    a single Chroma `where` filter, using `$and` only when more than
+    one condition is present (Chroma's where DSL wants an explicit
+    boolean operator for multi-condition filters, not an implicit AND
+    via a plain multi-key dict).
     """
-    conditions = []
+    conditions = [{"owner": owner}]
     if repository:
         conditions.append({"repository": repository})
     if content_types:
         conditions.append({"content_type": {"$in": content_types}})
-    if not conditions:
-        return None
     if len(conditions) == 1:
         return conditions[0]
     return {"$and": conditions}
 
 
-def _complete_partial_classes(hits: list[dict]) -> list[dict]:
+def _complete_partial_classes(hits: list[dict], owner: str) -> list[dict]:
     """
     Replace any retrieved single-method code chunk with its complete
     whole-class chunk, so the LLM sees the class's constructor, shared
@@ -282,7 +281,7 @@ def _complete_partial_classes(hits: list[dict]) -> list[dict]:
         if metadata.get("content_type") == "method" and class_id:
             if class_id in seen_class_ids:
                 continue  # already represented by the complete class
-            full_class = get_class_chunk(class_id)
+            full_class = get_class_chunk(class_id, owner)
             if full_class is not None:
                 seen_class_ids.add(class_id)
                 completed.append(full_class)
@@ -299,6 +298,7 @@ def retrieve(
     repository: str | None = None,
     kb: str | None = None,
     *,
+    owner: str,
     query_transform_enabled: bool | None = None,
 ) -> list[dict]:
     """
@@ -307,6 +307,12 @@ def retrieve(
     Args:
         query_text: The user's natural-language question.
         top_k: How many chunks to retrieve.
+        owner: The logged-in account (or the LOCAL_OWNER constant when
+            auth is disabled - see api.deps) whose documents this
+            search is scoped to. Required, not optional: every chunk
+            in every collection now carries an owner tag, and every
+            where-filter this module builds includes it, so retrieval
+            can never see another account's data.
         repository: Optional "owner/repo" filter (see
             app.ingestion.loader.load_github_repository's `repository`
             metadata). When given, only chunks from that repo are
@@ -359,7 +365,7 @@ def retrieve(
     if kb is not None:
         target_kbs = [kb]
     else:
-        target_kbs = decision.kbs or list_populated_kbs()
+        target_kbs = decision.kbs or list_populated_kbs(owner)
 
     seen_chunks: set[tuple] = set()
     candidates: list[dict] = []
@@ -377,7 +383,7 @@ def retrieve(
         # when routing correctly identified GitHub as relevant.
         if kb == "github":
             github_hits, _ = retrieve_github_adaptive(
-                query_text, top_k=top_k, repository=repository,
+                query_text, top_k=top_k, repository=repository, owner=owner,
                 query_transform_enabled=query_transform_enabled,
             )
             for hit in github_hits:
@@ -395,7 +401,7 @@ def retrieve(
         # re-scored by a cross-encoder (see
         # app.retrieval.hybrid_retriever).
         if kb in _HYBRID_KBS:
-            where = _build_where(repository, None)
+            where = _build_where(owner, repository, None)
             # Query transformation (see app.retrieval.query_transform):
             # when enabled, produces a rewritten query, paraphrases,
             # sub-questions, a HyDE answer paragraph, and topical
@@ -408,7 +414,7 @@ def retrieve(
             # so ranking never drifts from the user's actual question.
             transform = transform_query(query_text, kb=kb, enabled=query_transform_enabled)
             for hit in retrieve_hybrid(
-                query_text, query_vector, kb=kb, top_k=top_k, where=where,
+                query_text, query_vector, kb=kb, top_k=top_k, owner=owner, where=where,
                 variants=transform.variants,
                 hyde_answer=transform.hyde_answer,
                 keywords=transform.keywords,
@@ -436,9 +442,9 @@ def retrieve(
             # it, only whatever the unscoped search happened to rank
             # highly.
             if "table" in decision.routes:
-                table_where = _build_where(repository, _ROUTE_CONTENT_TYPES["table"])
+                table_where = _build_where(owner, repository, _ROUTE_CONTENT_TYPES["table"])
                 for hit in retrieve_hybrid(
-                    query_text, query_vector, kb=kb, top_k=top_k, where=table_where,
+                    query_text, query_vector, kb=kb, top_k=top_k, owner=owner, where=table_where,
                     variants=transform.variants,
                     hyde_answer=transform.hyde_answer,
                     keywords=transform.keywords,
@@ -453,8 +459,8 @@ def retrieve(
             continue
 
     hits = _rerank_by_title_overlap(query_text, candidates, top_k)
-    hits = _complete_partial_tables(hits)
-    return _complete_partial_classes(hits)
+    hits = _complete_partial_tables(hits, owner)
+    return _complete_partial_classes(hits, owner)
 
 
 def _rerank_images_by_alt_text_overlap(query_text: str, hits: list[dict], top_k: int) -> list[dict]:
@@ -521,7 +527,7 @@ def _rerank_images_by_alt_text_overlap(query_text: str, hits: list[dict], top_k:
     return [hit for _, hit in scored[:top_k]]
 
 
-def retrieve_images(query_text: str, top_k: int = 3, kb: str | None = None) -> list[dict]:
+def retrieve_images(query_text: str, top_k: int = 3, kb: str | None = None, *, owner: str) -> list[dict]:
     """
     Find the top_k stored images most relevant to a user's question,
     using the multimodal CLIP model (app.embeddings.image_embedder)
@@ -539,25 +545,27 @@ def retrieve_images(query_text: str, top_k: int = 3, kb: str | None = None) -> l
         top_k: How many images to retrieve.
         kb: Optional KB scope ("web" or "video" - the only two
             source_kb values images ever have). None (cross-KB chat)
-            searches every stored image regardless of origin, matching
-            the same "no explicit KB signal = search everything"
-            behavior retrieve() itself uses. When given, filters to
-            just that KB's images BEFORE similarity search - without
-            this, a question asked in one video's per-KB chat tab
-            could surface an unrelated web screenshot or a frame from
-            a completely different ingested video, since this
-            collection is shared across every image source (see
-            app.vectorstore.store's module docstring).
+            searches every image THIS OWNER has stored regardless of
+            origin, matching the same "no explicit KB signal = search
+            everything" behavior retrieve() itself uses. When given,
+            additionally filters to just that KB's images BEFORE
+            similarity search - without this, a question asked in one
+            video's per-KB chat tab could surface an unrelated web
+            screenshot or a frame from a completely different ingested
+            video, since this collection is shared across every image
+            source (see app.vectorstore.store's module docstring).
+        owner: Required - scopes the search to this account's own
+            images only, same reasoning as retrieve()'s `owner`.
 
     Returns:
         A list of dicts, each with "content" (the image's alt text),
         "metadata" (image_url, page_url, alt_text, page_title),
         "distance", and "similarity", ordered from most to least
-        similar. Empty list if no images have been ingested yet.
+        similar. Empty list if this owner hasn't ingested any images yet.
     """
     logger.info("Retrieving top_k=%d image(s) for query: %r (kb=%r)", top_k, query_text, kb)
     query_vector = embed_text_for_image_search(query_text)
-    where = {"source_kb": kb} if kb else None
+    where = {"$and": [{"source_kb": kb}, {"owner": owner}]} if kb else {"owner": owner}
     # Same wider-candidate-pool + lexical-boost-rerank fix as retrieve()
     # above, applied to images (see _rerank_images_by_alt_text_overlap).
     # Needs a much wider pool than the text version's 50: most of this
@@ -577,7 +585,7 @@ def retrieve_images(query_text: str, top_k: int = 3, kb: str | None = None) -> l
     return _rerank_images_by_alt_text_overlap(query_text, candidates, top_k)
 
 
-def retrieve_audio_clips(query_text: str, top_k: int = 3, kb: str | None = None) -> list[dict]:
+def retrieve_audio_clips(query_text: str, top_k: int = 3, kb: str | None = None, *, owner: str) -> list[dict]:
     """
     Find the top_k stored audio clips most relevant to a user's
     question, using CLAP (app.embeddings.audio_embedder) rather than
@@ -599,25 +607,27 @@ def retrieve_audio_clips(query_text: str, top_k: int = 3, kb: str | None = None)
         kb: Optional KB scope ("audio" or "video" - the only two
             source_kb values a clip ever has, see
             app.ingestion.ingest._ingest_audio_clips). None (cross-KB
-            chat) searches every stored clip regardless of which file
-            it came from. When given, filters to just that KB's clips
-            BEFORE similarity search - without this, a question asked
-            about one specific video could surface an unrelated clip
-            from a completely different ingested audio/video file,
-            since this collection has no other notion of "which KB" a
-            clip belongs to.
+            chat) searches every clip THIS OWNER has stored regardless
+            of which file it came from. When given, additionally
+            filters to just that KB's clips BEFORE similarity search -
+            without this, a question asked about one specific video
+            could surface an unrelated clip from a completely
+            different ingested audio/video file, since this collection
+            has no other notion of "which KB" a clip belongs to.
+        owner: Required - scopes the search to this account's own
+            clips only, same reasoning as retrieve()'s `owner`.
 
     Returns:
         A list of dicts, each with "content" (a short label),
         "metadata" (document_id, start_seconds, end_seconds,
         source_audio_url), "distance", and "similarity", ordered from
-        most to least similar. Empty list if no audio clips have been
-        ingested yet (e.g. ENABLE_AUDIO_SIMILARITY_SEARCH was never
-        turned on).
+        most to least similar. Empty list if this owner has no audio
+        clips ingested yet (e.g. ENABLE_AUDIO_SIMILARITY_SEARCH was
+        never turned on).
     """
     logger.info("Retrieving top_k=%d audio clip(s) for query: %r (kb=%r)", top_k, query_text, kb)
     query_vector = embed_text_for_audio_search(query_text)
-    where = {"source_kb": kb} if kb else None
+    where = {"$and": [{"source_kb": kb}, {"owner": owner}]} if kb else {"owner": owner}
     return query_audio_clip_embedding(query_vector, top_k=top_k, where=where)
 
 
@@ -628,7 +638,7 @@ if __name__ == "__main__":
     query_text = sys.argv[1] if len(sys.argv) > 1 else "What is this repository about?"
     top_k = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
-    results = retrieve(query_text, top_k=top_k)
+    results = retrieve(query_text, top_k=top_k, owner="local")
 
     print(f"Query: '{query_text}'")
     print(f"Top {len(results)} retrieved chunks:")

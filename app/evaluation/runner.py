@@ -171,9 +171,17 @@ def run_evaluation(
     items: list[EvalItem],
     config: EvalConfig,
     *,
+    owner: str = "local",
     progress_callback=None,
 ) -> EvalReport:
     """Execute the dataset. Returns a fully-populated ``EvalReport``.
+
+    ``owner``: which account's ingested data to evaluate against
+    (defaults to "local", i.e. auth disabled) - evaluation stays a
+    single-operator workflow (see module docstring), it just needs to
+    know WHICH operator's data to search now that documents are
+    owner-scoped, so results don't come back empty for an account
+    other than "local".
 
     ``progress_callback(index, total, item)`` is invoked before each
     item runs - the Streamlit UI uses this to update a progress bar.
@@ -215,7 +223,7 @@ def run_evaluation(
                     progress_callback(idx, len(items), item)
                 except Exception:  # noqa: BLE001 - UI callback never breaks the run
                     logger.exception("progress_callback failed; continuing run.")
-            results.append(_run_one(item, config))
+            results.append(_run_one(item, config, owner))
     finally:
         _set_crag_enabled(prev_crag)
         _set_query_transform_enabled(prev_qt)
@@ -230,7 +238,7 @@ def run_evaluation(
     )
 
 
-def _run_one(item: EvalItem, config: EvalConfig) -> ItemResult:
+def _run_one(item: EvalItem, config: EvalConfig, owner: str) -> ItemResult:
     """Execute one item end-to-end. Errors are captured on the
     result rather than raised, so one broken question can't abort a
     50-item batch."""
@@ -254,6 +262,7 @@ def _run_one(item: EvalItem, config: EvalConfig) -> ItemResult:
                 use_vision=False,
                 repository=None,
                 kb=kb_used,
+                owner=owner,
             )
         )
         latency_context_prep = time.perf_counter() - t_ctx0

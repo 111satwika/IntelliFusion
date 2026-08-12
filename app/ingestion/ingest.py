@@ -258,7 +258,7 @@ def _already_extracted_image_urls() -> set[str]:
     return urls
 
 
-def _ingest_images(document: Document) -> int:
+def _ingest_images(document: Document, owner: str) -> int:
     """
     Extract, download (once), embed (via CLIP), and extract text from
     every image found in a single Document's content (see
@@ -359,7 +359,7 @@ def _ingest_images(document: Document) -> int:
             # question scoped to one KB tab doesn't match images from
             # a completely different source (see that function's
             # docstring for why this matters).
-            "metadata": {**records_by_url[url], "origin": "web_image", "source_kb": "web"},
+            "metadata": {**records_by_url[url], "origin": "web_image", "source_kb": "web", "owner": owner},
         }
         for url, embedding in zip(valid_urls, embeddings)
     ]
@@ -392,6 +392,7 @@ def _ingest_images(document: Document) -> int:
                     "content_type": content_type,
                     "image_url": url,
                     "source_type": "web",
+                    "owner": owner,
                     # This chunk bypasses chunk_with_parent_child (it's
                     # a standalone OCR/vision extraction, not part of a
                     # parent/child pair), but app.retrieval.hybrid_
@@ -430,7 +431,7 @@ def _ingest_images(document: Document) -> int:
     return len(image_chunks)
 
 
-def _ingest_video_frames(document: Document, file_path: str) -> int:
+def _ingest_video_frames(document: Document, file_path: str, owner: str) -> int:
     """
     Embed every sampled frame of a video with CLIP (visual similarity
     search - see app.embeddings.image_embedder), storing each into the
@@ -485,7 +486,7 @@ def _ingest_video_frames(document: Document, file_path: str) -> int:
 
     image_chunks = []
     for timestamp, frame, embedding in zip(timestamps, frames, embeddings):
-        thumbnail_url = media_store.save_frame_thumbnail(document_id, timestamp, frame)
+        thumbnail_url = media_store.save_frame_thumbnail(document_id, owner, timestamp, frame)
         image_chunks.append(
             {
                 "content": f"Frame from {document_id} at {_format_timestamp_label(timestamp)}",
@@ -502,6 +503,7 @@ def _ingest_video_frames(document: Document, file_path: str) -> int:
                     # is none today, but source_kb is the general
                     # mechanism) or web images never leak in.
                     "source_kb": "video",
+                    "owner": owner,
                 },
             }
         )
@@ -520,7 +522,7 @@ def _format_timestamp_label(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _ingest_audio_clips(document: Document, file_path: str) -> int:
+def _ingest_audio_clips(document: Document, file_path: str, owner: str) -> int:
     """
     Embed every sampled 10s window of an audio/video file's audio
     track with CLAP (acoustic similarity search - see
@@ -555,7 +557,7 @@ def _ingest_audio_clips(document: Document, file_path: str) -> int:
     waveforms = [waveform for _start, _end, waveform in clips]
 
     embeddings = embed_audio_clips(waveforms)
-    source_url = media_store.save_media_copy(document_id, file_path)
+    source_url = media_store.save_media_copy(document_id, owner, file_path)
 
     clip_chunks = [
         {
@@ -573,6 +575,7 @@ def _ingest_audio_clips(document: Document, file_path: str) -> int:
                 # a clip from a completely different ingested file -
                 # see that function's docstring for why this matters.
                 "source_kb": document.metadata.get("source_type"),
+                "owner": owner,
             },
         }
         for start, end, embedding in zip(starts, ends, embeddings)
@@ -588,6 +591,7 @@ def ingest_all(
     urls_file: str = URLS_FILE,
     chunk_size: int = 150,
     chunk_overlap: int = 30,
+    owner: str = "local",
 ) -> int:
     """
     Load every supported source file under raw_dir plus every URL
@@ -624,11 +628,16 @@ def ingest_all(
     total_images = 0
     total_audio_clips = 0
     for document in documents:
+        # Stamped BEFORE chunking so every resulting chunk's metadata
+        # carries it too (chunk_document/chunk_with_parent_child build
+        # each Chunk's metadata FROM document.metadata - same
+        # propagation path document_id/source_type already rely on).
+        document.metadata["owner"] = owner
         chunks = chunk_with_parent_child(document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         embedded_chunks = embed_chunks(chunks)
         add_embedded_chunks(embedded_chunks)
         total_chunks += len(chunks)
-        total_images += _ingest_images(document)
+        total_images += _ingest_images(document, owner)
         # Native visual/acoustic similarity search (see
         # _ingest_video_frames/_ingest_audio_clips) - file_path is
         # already set by load_video_document/load_audio_document
@@ -637,9 +646,9 @@ def ingest_all(
         # sample for CLAP.
         source_type = document.metadata.get("source_type")
         if source_type == "video":
-            total_images += _ingest_video_frames(document, document.metadata["file_path"])
+            total_images += _ingest_video_frames(document, document.metadata["file_path"], owner)
         if source_type in ("audio", "video"):
-            total_audio_clips += _ingest_audio_clips(document, document.metadata["file_path"])
+            total_audio_clips += _ingest_audio_clips(document, document.metadata["file_path"], owner)
 
     logger.info(
         "Ingestion complete: stored %d chunk(s), %d image(s), %d audio clip(s) total across %d "
@@ -661,6 +670,7 @@ def ingest_github_repo(
     chunk_size: int = 150,
     chunk_overlap: int = 30,
     max_files: int = 300,
+    owner: str = "local",
 ) -> int:
     """
     Ingest a single GitHub repository on demand: any repo the caller
@@ -694,6 +704,10 @@ def ingest_github_repo(
         chunk_size: Passed through to chunk_with_parent_child.
         chunk_overlap: Passed through to chunk_with_parent_child.
         max_files: Cap on how many files to ingest from the repo.
+        owner: The local logged-in account this repo belongs to (or
+            "local" when auth is disabled) - stamped onto every
+            resulting chunk's metadata and used to namespace the
+            per-repo code graph on disk (see app.graph.code_graph).
 
     Returns:
         The number of text chunks stored.
@@ -703,6 +717,7 @@ def ingest_github_repo(
 
     total_chunks = 0
     for document in documents:
+        document.metadata["owner"] = owner
         chunks = chunk_with_parent_child(document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         embedded_chunks = embed_chunks(chunks)
         add_embedded_chunks(embedded_chunks)
@@ -726,7 +741,7 @@ def ingest_github_repo(
                 if doc.metadata.get("file_path")
             ]
             graph = build_repository_graph(repository, file_pairs)
-            save_repository_graph(graph, repository)
+            save_repository_graph(graph, repository, owner)
 
     logger.info(
         "GitHub ingestion complete for '%s': stored %d chunk(s) across %d file(s). "
@@ -745,6 +760,7 @@ def ingest_github_activity(
     include_prs: bool = True,
     include_discussions: bool = True,
     max_items: int = 200,
+    account_owner: str = "local",
 ) -> dict:
     """
     Ingest a repository's Issues, Pull Requests, and/or Discussions -
@@ -782,6 +798,11 @@ def ingest_github_activity(
             to fetch and ingest.
         max_items: Cap on how many of EACH kind to fetch (passed
             through as max_items to each loader).
+        account_owner: The local logged-in account this activity
+            belongs to (or "local" when auth is disabled) - named
+            distinctly from the `owner` local variable below (the
+            GitHub "owner" half of "owner/repo") to keep the two
+            unrelated meanings of "owner" from colliding.
 
     Returns:
         {"repository": "owner/repo", "issues": N, "pull_requests": N,
@@ -798,6 +819,7 @@ def ingest_github_activity(
         documents = load_github_issues(owner, repo, max_items=max_items)
         counts["issues"] = len(documents)
         for document in documents:
+            document.metadata["owner"] = account_owner
             chunks = chunk_with_parent_child(document)
             add_embedded_chunks(embed_chunks(chunks))
             total_chunks += len(chunks)
@@ -806,6 +828,7 @@ def ingest_github_activity(
         documents = load_github_pull_requests(owner, repo, max_items=max_items)
         counts["pull_requests"] = len(documents)
         for document in documents:
+            document.metadata["owner"] = account_owner
             chunks = chunk_with_parent_child(document)
             add_embedded_chunks(embed_chunks(chunks))
             total_chunks += len(chunks)
@@ -814,6 +837,7 @@ def ingest_github_activity(
         documents = load_github_discussions(owner, repo, max_items=max_items)
         counts["discussions"] = len(documents)
         for document in documents:
+            document.metadata["owner"] = account_owner
             chunks = chunk_with_parent_child(document)
             add_embedded_chunks(embed_chunks(chunks))
             total_chunks += len(chunks)

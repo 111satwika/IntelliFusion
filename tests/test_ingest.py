@@ -287,7 +287,7 @@ def test_ingest_images_stores_image_chunks_and_ocr_text_chunks(monkeypatch):
     monkeypatch.setattr(ingest, "embed_texts", lambda texts: [[0.9, 0.8]])
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda chunks: calls.append(("add_embedded_chunks", chunks)))
 
-    stored = ingest._ingest_images(document)
+    stored = ingest._ingest_images(document, "local")
 
     assert stored == 1
     assert calls[0][0] == "add_image_chunks"
@@ -313,7 +313,7 @@ def test_ingest_images_skips_ocr_text_chunk_when_no_text_found(monkeypatch):
     monkeypatch.setattr(ingest, "analyze_frame", lambda image: FrameAnalysis(text="", image_type=OTHER))
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda chunks: calls.append(("add_embedded_chunks", chunks)))
 
-    stored = ingest._ingest_images(document)
+    stored = ingest._ingest_images(document, "local")
 
     assert stored == 1
     assert [call[0] for call in calls] == ["add_image_chunks"]  # no OCR text chunk was stored
@@ -322,7 +322,7 @@ def test_ingest_images_skips_ocr_text_chunk_when_no_text_found(monkeypatch):
 def test_ingest_images_returns_zero_for_document_with_no_images(monkeypatch):
     monkeypatch.setattr(ingest, "extract_image_records", lambda doc: [])
 
-    assert ingest._ingest_images(Document(content="no images", metadata={})) == 0
+    assert ingest._ingest_images(Document(content="no images", metadata={}), "local") == 0
 
 
 def test_ingest_images_skips_undownloadable_images(monkeypatch):
@@ -331,7 +331,7 @@ def test_ingest_images_skips_undownloadable_images(monkeypatch):
     monkeypatch.setattr(ingest, "extract_image_records", lambda doc: records)
     monkeypatch.setattr(ingest, "download_image", lambda url: None)
 
-    assert ingest._ingest_images(Document(content="doc", metadata={})) == 0
+    assert ingest._ingest_images(Document(content="doc", metadata={}), "local") == 0
 
 
 def test_ingest_images_marks_new_web_image_chunks_with_origin(monkeypatch):
@@ -350,7 +350,7 @@ def test_ingest_images_marks_new_web_image_chunks_with_origin(monkeypatch):
     monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(chunks))
     monkeypatch.setattr(ingest, "analyze_frame", lambda image: FrameAnalysis(text="", image_type=OTHER))
 
-    ingest._ingest_images(document)
+    ingest._ingest_images(document, "local")
 
     assert calls[0][0]["metadata"]["origin"] == "web_image"
 
@@ -364,12 +364,12 @@ def test_ingest_video_frames_embeds_and_stores_each_sampled_frame(monkeypatch):
     monkeypatch.setattr(ingest, "embed_images", lambda frames: [[0.1, 0.2], [0.3, 0.4]])
     monkeypatch.setattr(
         ingest.media_store, "save_frame_thumbnail",
-        lambda document_id, timestamp, frame: f"/media/frames/{document_id}_{int(timestamp)}.jpg",
+        lambda document_id, owner, timestamp, frame: f"/media/frames/{document_id}_{int(timestamp)}.jpg",
     )
     calls = []
     monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(chunks))
 
-    stored = ingest._ingest_video_frames(document, "tutorial.mp4")
+    stored = ingest._ingest_video_frames(document, "tutorial.mp4", "local")
 
     assert stored == 2
     chunks = calls[0]
@@ -388,7 +388,7 @@ def test_ingest_video_frames_returns_zero_when_no_frames_sampled(monkeypatch):
     calls = []
     monkeypatch.setattr(ingest, "add_image_chunks", lambda chunks: calls.append(chunks))
 
-    stored = ingest._ingest_video_frames(document, "silent.mp4")
+    stored = ingest._ingest_video_frames(document, "silent.mp4", "local")
 
     assert stored == 0
     assert not calls
@@ -402,7 +402,7 @@ def test_ingest_audio_clips_is_a_noop_when_disabled(monkeypatch):
     calls = []
     monkeypatch.setattr(ingest, "_sample_audio_clips", lambda path: calls.append(1) or iter([]))
 
-    stored = ingest._ingest_audio_clips(document, "meeting.mp3")
+    stored = ingest._ingest_audio_clips(document, "meeting.mp3", "local")
 
     assert stored == 0
     assert not calls
@@ -415,11 +415,14 @@ def test_ingest_audio_clips_embeds_and_stores_each_sampled_clip(monkeypatch):
 
     monkeypatch.setattr(ingest, "_sample_audio_clips", lambda path: iter(fake_clips))
     monkeypatch.setattr(ingest, "embed_audio_clips", lambda waveforms: [[0.1, 0.2], [0.3, 0.4]])
-    monkeypatch.setattr(ingest.media_store, "save_media_copy", lambda document_id, path: f"/media/sources/{document_id}.mp3")
+    monkeypatch.setattr(
+        ingest.media_store, "save_media_copy",
+        lambda document_id, owner, path: f"/media/sources/{document_id}.mp3",
+    )
     calls = []
     monkeypatch.setattr(ingest, "add_audio_clip_chunks", lambda chunks: calls.append(chunks))
 
-    stored = ingest._ingest_audio_clips(document, "meeting.mp3")
+    stored = ingest._ingest_audio_clips(document, "meeting.mp3", "local")
 
     assert stored == 2
     chunks = calls[0]
@@ -438,7 +441,7 @@ def test_ingest_audio_clips_returns_zero_when_no_clips_sampled(monkeypatch):
     calls = []
     monkeypatch.setattr(ingest, "add_audio_clip_chunks", lambda chunks: calls.append(chunks))
 
-    stored = ingest._ingest_audio_clips(document, "silent.mp4")
+    stored = ingest._ingest_audio_clips(document, "silent.mp4", "local")
 
     assert stored == 0
     assert not calls
@@ -465,7 +468,7 @@ def test_ingest_images_runs_vision_extraction_for_code_classified_images(monkeyp
     monkeypatch.setattr(ingest, "embed_texts", lambda texts: [[0.9, 0.8]])
     monkeypatch.setattr(ingest, "add_embedded_chunks", lambda chunks: calls.append(("add_embedded_chunks", chunks)))
 
-    stored = ingest._ingest_images(document)
+    stored = ingest._ingest_images(document, "local")
 
     assert stored == 1
     code_chunk = calls[1][1][0]

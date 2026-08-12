@@ -59,29 +59,38 @@ _ALLOWED_SOURCE_EXTENSIONS = {
 }
 
 
-def _document_hash(document_id: str) -> str:
-    """Stable, filesystem-safe, non-user-controlled filename component."""
-    return hashlib.sha1(document_id.encode("utf-8")).hexdigest()[:16]
+def _document_hash(document_id: str, owner: str) -> str:
+    """
+    Stable, filesystem-safe, non-user-controlled filename component.
+    Mixes in `owner` (not just document_id) so two different accounts
+    uploading a file that produces the same document_id (e.g. both
+    upload a video literally named "video.mp4") get distinct files on
+    disk instead of colliding/overwriting each other - document_id
+    itself is left untouched (see app.vectorstore.store's module
+    docstring for why: it's a user-visible display value elsewhere).
+    """
+    return hashlib.sha1(f"{owner}::{document_id}".encode("utf-8")).hexdigest()[:16]
 
 
-def save_frame_thumbnail(document_id: str, timestamp_seconds: float, image: Image.Image) -> str:
+def save_frame_thumbnail(document_id: str, owner: str, timestamp_seconds: float, image: Image.Image) -> str:
     """
     Save one sampled video frame as a small JPEG thumbnail, return the
     URL path it will be servable at (via server.py's `/media` mount).
 
-    Filename is deterministic (same document_id + timestamp always
-    produces the same path), so re-ingesting the same video overwrites
-    the same thumbnails instead of accumulating stale duplicates.
+    Filename is deterministic (same owner + document_id + timestamp
+    always produces the same path), so re-ingesting the same video
+    overwrites the same thumbnails instead of accumulating stale
+    duplicates.
     """
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     timestamp_ms = int(timestamp_seconds * 1000)
-    filename = f"{_document_hash(document_id)}_{timestamp_ms}.jpg"
+    filename = f"{_document_hash(document_id, owner)}_{timestamp_ms}.jpg"
     path = FRAMES_DIR / filename
     image.convert("RGB").save(path, format="JPEG", quality=85)
     return f"/media/frames/{filename}"
 
 
-def save_media_copy(document_id: str, file_path: str) -> str | None:
+def save_media_copy(document_id: str, owner: str, file_path: str) -> str | None:
     """
     Copy an ingested audio/video source file into the served media
     tree ONCE, so audio-clip playback has a real file to seek into
@@ -103,18 +112,19 @@ def save_media_copy(document_id: str, file_path: str) -> str | None:
         return None
 
     SOURCES_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"{_document_hash(document_id)}{ext}"
+    filename = f"{_document_hash(document_id, owner)}{ext}"
     dest = SOURCES_DIR / filename
     if not dest.exists():
         shutil.copyfile(file_path, dest)
     return f"/media/sources/{filename}"
 
 
-def delete_media_for_document(document_id: str) -> int:
+def delete_media_for_document(document_id: str, owner: str) -> int:
     """
     Remove every saved frame thumbnail and source-file copy for a
-    document, keyed off the same hash save_frame_thumbnail()/
-    save_media_copy() derive their filenames from.
+    document, keyed off the same owner+document_id hash
+    save_frame_thumbnail()/save_media_copy() derive their filenames
+    from.
 
     Called from app.vectorstore.store.delete_document() so deleting a
     document from the UI doesn't leave orphaned files under data/media/
@@ -130,7 +140,7 @@ def delete_media_for_document(document_id: str) -> int:
     Returns:
         How many files were actually deleted.
     """
-    doc_hash = _document_hash(document_id)
+    doc_hash = _document_hash(document_id, owner)
     deleted = 0
 
     for path in FRAMES_DIR.glob(f"{doc_hash}_*.jpg"):

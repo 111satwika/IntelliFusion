@@ -149,7 +149,7 @@ def test_query_embedding_only_searches_the_requested_kb(isolated_store):
 
 
 def test_list_populated_kbs_only_returns_kbs_with_data(isolated_store):
-    assert isolated_store.list_populated_kbs() == []
+    assert isolated_store.list_populated_kbs("local") == []
 
     isolated_store.add_embedded_chunks(
         [
@@ -161,7 +161,7 @@ def test_list_populated_kbs_only_returns_kbs_with_data(isolated_store):
         ]
     )
 
-    assert isolated_store.list_populated_kbs() == ["pdf"]
+    assert isolated_store.list_populated_kbs("local") == ["pdf"]
 
 
 def test_query_embedding_with_where_filter_scopes_to_matching_metadata(isolated_store):
@@ -207,11 +207,11 @@ def test_list_repositories_returns_distinct_repositories_only(isolated_store):
 
     isolated_store.add_embedded_chunks(chunks)
 
-    assert isolated_store.list_repositories() == ["owner/repo-a"]
+    assert isolated_store.list_repositories("local") == ["owner/repo-a"]
 
 
 def test_list_repositories_returns_empty_list_when_none_ingested(isolated_store):
-    assert isolated_store.list_repositories() == []
+    assert isolated_store.list_repositories("local") == []
 
 
 def test_multi_page_chunks_get_distinct_ids_instead_of_colliding(isolated_store):
@@ -279,7 +279,7 @@ def test_get_table_chunk_returns_the_whole_table_not_a_row(isolated_store):
 
     isolated_store.add_embedded_chunks(chunks)
 
-    result = isolated_store.get_table_chunk("doc.md::table_0")
+    result = isolated_store.get_table_chunk("doc.md::table_0", "local")
 
     assert result is not None
     assert result["content"] == "whole table content"
@@ -287,7 +287,7 @@ def test_get_table_chunk_returns_the_whole_table_not_a_row(isolated_store):
 
 
 def test_get_table_chunk_returns_none_when_no_match(isolated_store):
-    assert isolated_store.get_table_chunk("nonexistent") is None
+    assert isolated_store.get_table_chunk("nonexistent", "local") is None
 
 
 def test_get_class_chunk_returns_the_whole_class_not_a_method(isolated_store):
@@ -316,7 +316,7 @@ def test_get_class_chunk_returns_the_whole_class_not_a_method(isolated_store):
 
     isolated_store.add_embedded_chunks(chunks)
 
-    result = isolated_store.get_class_chunk("foo.py::class_0")
+    result = isolated_store.get_class_chunk("foo.py::class_0", "local")
 
     assert result is not None
     assert result["content"] == "[Class: Foo]\n\nclass Foo:\n    ..."
@@ -324,7 +324,7 @@ def test_get_class_chunk_returns_the_whole_class_not_a_method(isolated_store):
 
 
 def test_get_class_chunk_returns_none_when_no_match(isolated_store):
-    assert isolated_store.get_class_chunk("nonexistent") is None
+    assert isolated_store.get_class_chunk("nonexistent", "local") is None
 
 
 def test_get_chunks_by_content_type_returns_matching_chunks_only(isolated_store):
@@ -348,7 +348,10 @@ def test_get_chunks_by_content_type_returns_matching_chunks_only(isolated_store)
     assert len(results) == 1
     assert results[0]["content"] == "ocr text from image one"
     assert results[0]["metadata"]["content_type"] == "image_ocr"
-    assert results[0]["id"] == "https://example.com/a.png::chunk_0"
+    # Storage id is owner-prefixed (see store.add_embedded_chunks) -
+    # document_id itself (the metadata VALUE) stays untouched, only
+    # the internal Chroma id changed shape.
+    assert results[0]["id"] == "local::https://example.com/a.png::chunk_0"
 
 
 def test_get_chunks_by_content_type_returns_empty_list_when_no_match(isolated_store):
@@ -588,7 +591,7 @@ def test_delete_document_removes_matching_text_chunks(isolated_store):
     ]
     isolated_store.add_embedded_chunks(chunks)
 
-    deleted = isolated_store.delete_document("delete.md")
+    deleted = isolated_store.delete_document("delete.md", "local")
 
     assert deleted == 1
     assert isolated_store.count() == 1
@@ -598,7 +601,7 @@ def test_delete_document_removes_video_frames_from_the_image_collection(isolated
     # Regression test: before this, deleting a video's text chunks left
     # its frames orphaned in the image collection forever - there was
     # no cleanup path for them at all.
-    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: 0)
+    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id, owner: 0)
     isolated_store.add_embedded_chunks([
         EmbeddedChunk(content="transcript", embedding=[1.0, 0.0], metadata={"document_id": "tutorial.mp4", "chunk_index": 0, "source_type": "video"}),
     ])
@@ -615,7 +618,7 @@ def test_delete_document_removes_video_frames_from_the_image_collection(isolated
         },
     ])
 
-    isolated_store.delete_document("tutorial.mp4")
+    isolated_store.delete_document("tutorial.mp4", "local")
 
     assert isolated_store.image_count() == 1  # only the unrelated web image survives
     remaining = isolated_store.query_image_embedding([1.0, 0.0], top_k=5)
@@ -623,7 +626,7 @@ def test_delete_document_removes_video_frames_from_the_image_collection(isolated
 
 
 def test_delete_document_removes_web_page_images_by_page_url(isolated_store, monkeypatch):
-    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: 0)
+    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id, owner: 0)
     isolated_store.add_image_chunks([
         {
             "content": "diagram",
@@ -632,13 +635,13 @@ def test_delete_document_removes_web_page_images_by_page_url(isolated_store, mon
         },
     ])
 
-    isolated_store.delete_document("https://example.com/docs")
+    isolated_store.delete_document("https://example.com/docs", "local")
 
     assert isolated_store.image_count() == 0
 
 
 def test_delete_document_removes_audio_clips(isolated_store, monkeypatch):
-    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: 0)
+    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id, owner: 0)
     isolated_store.add_audio_clip_chunks([
         {
             "content": "clip",
@@ -647,15 +650,18 @@ def test_delete_document_removes_audio_clips(isolated_store, monkeypatch):
         },
     ])
 
-    isolated_store.delete_document("meeting.mp3")
+    isolated_store.delete_document("meeting.mp3", "local")
 
     assert isolated_store.audio_clip_count() == 0
 
 
 def test_delete_document_calls_media_store_cleanup_with_the_document_id(isolated_store, monkeypatch):
     calls = []
-    monkeypatch.setattr("app.media.media_store.delete_media_for_document", lambda document_id: calls.append(document_id) or 0)
+    monkeypatch.setattr(
+        "app.media.media_store.delete_media_for_document",
+        lambda document_id, owner: calls.append((document_id, owner)) or 0,
+    )
 
-    isolated_store.delete_document("tutorial.mp4")
+    isolated_store.delete_document("tutorial.mp4", "local")
 
-    assert calls == ["tutorial.mp4"]
+    assert calls == [("tutorial.mp4", "local")]

@@ -24,7 +24,7 @@ def test_save_frame_thumbnail_writes_a_jpeg_and_returns_a_media_url(tmp_path, mo
     frames_dir, _sources_dir = _isolated_dirs(tmp_path, monkeypatch)
     image = Image.new("RGB", (16, 16))
 
-    url = media_store.save_frame_thumbnail("tutorial.mp4", 65.0, image)
+    url = media_store.save_frame_thumbnail("tutorial.mp4", "local", 65.0, image)
 
     assert url.startswith("/media/frames/")
     assert url.endswith(".jpg")
@@ -36,12 +36,26 @@ def test_save_frame_thumbnail_is_deterministic_per_document_and_timestamp(tmp_pa
     _isolated_dirs(tmp_path, monkeypatch)
     image = Image.new("RGB", (16, 16))
 
-    url_a = media_store.save_frame_thumbnail("tutorial.mp4", 65.0, image)
-    url_b = media_store.save_frame_thumbnail("tutorial.mp4", 65.0, image)
-    url_c = media_store.save_frame_thumbnail("tutorial.mp4", 70.0, image)
+    url_a = media_store.save_frame_thumbnail("tutorial.mp4", "local", 65.0, image)
+    url_b = media_store.save_frame_thumbnail("tutorial.mp4", "local", 65.0, image)
+    url_c = media_store.save_frame_thumbnail("tutorial.mp4", "local", 70.0, image)
 
-    assert url_a == url_b  # same document + timestamp -> same file, overwrite not duplicate
+    assert url_a == url_b  # same owner + document + timestamp -> same file, overwrite not duplicate
     assert url_a != url_c
+
+
+def test_save_frame_thumbnail_differs_per_owner_for_the_same_document_id(tmp_path, monkeypatch):
+    # Regression test for the collision this owner param closes: two
+    # different accounts uploading a file that produces the same
+    # document_id (e.g. both name it "tutorial.mp4") must not overwrite
+    # each other's thumbnail.
+    _isolated_dirs(tmp_path, monkeypatch)
+    image = Image.new("RGB", (16, 16))
+
+    url_alice = media_store.save_frame_thumbnail("tutorial.mp4", "alice", 65.0, image)
+    url_bob = media_store.save_frame_thumbnail("tutorial.mp4", "bob", 65.0, image)
+
+    assert url_alice != url_bob
 
 
 def test_save_media_copy_copies_the_file_and_returns_a_media_url(tmp_path, monkeypatch):
@@ -49,7 +63,7 @@ def test_save_media_copy_copies_the_file_and_returns_a_media_url(tmp_path, monke
     source_file = tmp_path / "meeting.mp3"
     source_file.write_bytes(b"fake audio bytes")
 
-    url = media_store.save_media_copy("meeting.mp3", str(source_file))
+    url = media_store.save_media_copy("meeting.mp3", "local", str(source_file))
 
     assert url.startswith("/media/sources/")
     assert url.endswith(".mp3")
@@ -62,12 +76,12 @@ def test_save_media_copy_is_idempotent_skips_existing_target(tmp_path, monkeypat
     source_file = tmp_path / "meeting.mp3"
     source_file.write_bytes(b"original bytes")
 
-    first_url = media_store.save_media_copy("meeting.mp3", str(source_file))
+    first_url = media_store.save_media_copy("meeting.mp3", "local", str(source_file))
     saved_path = sources_dir / first_url.rsplit("/", 1)[-1]
     saved_path.write_bytes(b"pretend this was never touched again")
 
     source_file.write_bytes(b"changed bytes - should NOT be re-copied")
-    second_url = media_store.save_media_copy("meeting.mp3", str(source_file))
+    second_url = media_store.save_media_copy("meeting.mp3", "local", str(source_file))
 
     assert second_url == first_url
     assert saved_path.read_bytes() == b"pretend this was never touched again"
@@ -78,7 +92,7 @@ def test_save_media_copy_rejects_unrecognized_extension(tmp_path, monkeypatch):
     source_file = tmp_path / "notes.txt"
     source_file.write_bytes(b"not audio or video")
 
-    url = media_store.save_media_copy("notes.txt", str(source_file))
+    url = media_store.save_media_copy("notes.txt", "local", str(source_file))
 
     assert url is None
 
@@ -89,11 +103,11 @@ def test_delete_media_for_document_removes_frames_and_source_copy(tmp_path, monk
     source_file = tmp_path / "tutorial.mp4"
     source_file.write_bytes(b"fake video bytes")
 
-    media_store.save_frame_thumbnail("tutorial.mp4", 0.0, image)
-    media_store.save_frame_thumbnail("tutorial.mp4", 10.0, image)
-    media_store.save_media_copy("tutorial.mp4", str(source_file))
+    media_store.save_frame_thumbnail("tutorial.mp4", "local", 0.0, image)
+    media_store.save_frame_thumbnail("tutorial.mp4", "local", 10.0, image)
+    media_store.save_media_copy("tutorial.mp4", "local", str(source_file))
 
-    deleted = media_store.delete_media_for_document("tutorial.mp4")
+    deleted = media_store.delete_media_for_document("tutorial.mp4", "local")
 
     assert deleted == 3  # 2 frames + 1 source copy
     assert list(frames_dir.glob("*")) == []
@@ -108,12 +122,12 @@ def test_delete_media_for_document_leaves_other_documents_untouched(tmp_path, mo
     delete_file = tmp_path / "delete_me.mp4"
     delete_file.write_bytes(b"delete me")
 
-    media_store.save_frame_thumbnail("keep.mp4", 0.0, image)
-    media_store.save_media_copy("keep.mp4", str(keep_file))
-    media_store.save_frame_thumbnail("delete_me.mp4", 0.0, image)
-    media_store.save_media_copy("delete_me.mp4", str(delete_file))
+    media_store.save_frame_thumbnail("keep.mp4", "local", 0.0, image)
+    media_store.save_media_copy("keep.mp4", "local", str(keep_file))
+    media_store.save_frame_thumbnail("delete_me.mp4", "local", 0.0, image)
+    media_store.save_media_copy("delete_me.mp4", "local", str(delete_file))
 
-    deleted = media_store.delete_media_for_document("delete_me.mp4")
+    deleted = media_store.delete_media_for_document("delete_me.mp4", "local")
 
     assert deleted == 2
     remaining_frames = list(frames_dir.glob("*"))
@@ -122,9 +136,31 @@ def test_delete_media_for_document_leaves_other_documents_untouched(tmp_path, mo
     assert len(remaining_sources) == 1
 
 
+def test_delete_media_for_document_leaves_other_owners_untouched(tmp_path, monkeypatch):
+    # Regression test: deleting "alice"'s document must never remove
+    # "bob"'s files even if both happen to use the same document_id.
+    frames_dir, sources_dir = _isolated_dirs(tmp_path, monkeypatch)
+    image = Image.new("RGB", (16, 16))
+    alice_file = tmp_path / "alice.mp4"
+    alice_file.write_bytes(b"alice's video")
+    bob_file = tmp_path / "bob.mp4"
+    bob_file.write_bytes(b"bob's video")
+
+    media_store.save_frame_thumbnail("tutorial.mp4", "alice", 0.0, image)
+    media_store.save_media_copy("tutorial.mp4", "alice", str(alice_file))
+    media_store.save_frame_thumbnail("tutorial.mp4", "bob", 0.0, image)
+    media_store.save_media_copy("tutorial.mp4", "bob", str(bob_file))
+
+    deleted = media_store.delete_media_for_document("tutorial.mp4", "alice")
+
+    assert deleted == 2
+    assert len(list(frames_dir.glob("*"))) == 1
+    assert len(list(sources_dir.glob("*"))) == 1
+
+
 def test_delete_media_for_document_is_a_noop_for_an_unknown_document(tmp_path, monkeypatch):
     _isolated_dirs(tmp_path, monkeypatch)
 
-    deleted = media_store.delete_media_for_document("never-ingested.mp4")
+    deleted = media_store.delete_media_for_document("never-ingested.mp4", "local")
 
     assert deleted == 0

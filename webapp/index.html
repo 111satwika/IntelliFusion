@@ -126,6 +126,12 @@
   }
   .rail-foot-name { font-size: 13.5px; font-weight: 600; }
   .rail-foot-sub { font-size: 11.5px; color: var(--muted); }
+  .rail-foot-logout {
+    margin-left: auto; background: none; border: none; cursor: pointer; padding: 6px;
+    border-radius: 6px; color: var(--muted); display: flex; align-items: center; flex-shrink: 0;
+  }
+  .rail-foot-logout:hover { background: var(--surface-sunken); color: var(--ink); }
+  .rail-foot-logout svg { width: 15px; height: 15px; }
 
   /* ---------- Main ---------- */
   .main { padding: 34px 44px 60px; max-width: 1180px; }
@@ -403,11 +409,14 @@
     </div>
     <div class="rail-spacer"></div>
     <div class="rail-foot">
-      <div class="avatar">S</div>
+      <div class="avatar" id="rail-foot-avatar">?</div>
       <div>
-        <div class="rail-foot-name">Satwika</div>
+        <div class="rail-foot-name" id="rail-foot-name">…</div>
         <div class="rail-foot-sub">Local workspace</div>
       </div>
+      <button class="rail-foot-logout" id="rail-foot-logout" type="button" title="Log out">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+      </button>
     </div>
   </nav>
 

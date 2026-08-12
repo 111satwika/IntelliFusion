@@ -57,6 +57,12 @@ _PENDING_TRACKER_PATH = Path(__file__).resolve().parent / "data" / "pending_docu
 _PENDING_TRACKER_LOCK_PATH = _PENDING_TRACKER_PATH.with_suffix(".json.lock")
 _ABANDONED_SESSION_MINUTES = 30
 
+# Matches app.vectorstore.store._DEFAULT_OWNER's value (duplicated
+# rather than imported - this module is intentionally lightweight/
+# dependency-free at import time, see the lazy import inside
+# _cleanup_abandoned_sessions).
+_DEFAULT_OWNER = "local"
+
 # How many question/answer pairs are kept per conversation thread (see
 # module docstring) - old turns are dropped oldest-first once a thread
 # exceeds this.
@@ -158,31 +164,54 @@ def _cleanup_abandoned_sessions(tracker: dict, current_session_id: str) -> dict:
         pending = session_data.get("pending", {})
         for kb, entries in pending.items():
             for entry in entries:
+                # "owner" is stamped onto every pending entry by
+                # api/sources.py at add_pending() time - defaulting to
+                # _DEFAULT_OWNER covers entries added before per-user
+                # ownership existed, so an old pending record doesn't
+                # crash the sweep on upgrade.
+                entry_owner = entry.get("owner", _DEFAULT_OWNER)
                 if entry.get("repository"):
-                    delete_repository(entry["repository"])
+                    delete_repository(entry["repository"], entry_owner)
                 elif entry.get("document_id"):
-                    delete_document(entry["document_id"], kb=kb)
+                    delete_document(entry["document_id"], entry_owner, kb=kb)
         logger.info("Cleaned up abandoned session %s (%d KB(s))", session_id, len(pending))
     tracker["sessions"] = surviving
     return tracker
 
 
 def _ensure_session(tracker: dict, session_id: str) -> dict:
+    """Pending-document tracking ONLY - see module docstring's split
+    between this (anonymous, browser-tab-scoped, subject to the
+    30-minute abandonment sweep) and _ensure_user_record below
+    (permanent account settings/history, never swept)."""
     sessions = tracker.setdefault("sessions", {})
     if session_id not in sessions:
         sessions[session_id] = {
             "started_at": _now_iso(),
             "last_seen_at": _now_iso(),
             "pending": _empty_pending(),
-            "settings": dict(_DEFAULT_SETTINGS),
-            "history": {},
         }
     else:
         sessions[session_id]["last_seen_at"] = _now_iso()
         for kb in KB_LABELS:
             sessions[session_id]["pending"].setdefault(kb, [])
-        sessions[session_id].setdefault("settings", dict(_DEFAULT_SETTINGS))
-        sessions[session_id].setdefault("history", {})
+    return tracker
+
+
+def _ensure_user_record(tracker: dict, owner: str) -> dict:
+    """Settings + chat history ONLY, keyed by the real logged-in
+    username (or LOCAL_OWNER when auth is disabled - see api.deps) -
+    deliberately a separate top-level key from "sessions" above, and
+    deliberately never touched by _cleanup_abandoned_sessions: an
+    account's settings/history are meant to persist indefinitely, not
+    expire after 30 minutes of inactivity the way an anonymous
+    browser-tab session's in-progress pending uploads should."""
+    users = tracker.setdefault("users", {})
+    if owner not in users:
+        users[owner] = {"settings": dict(_DEFAULT_SETTINGS), "history": {}}
+    else:
+        users[owner].setdefault("settings", dict(_DEFAULT_SETTINGS))
+        users[owner].setdefault("history", {})
     return tracker
 
 
@@ -236,34 +265,37 @@ def remove_pending(session_id: str, kb: str, entry_key: str, entry_value: str) -
         _save_tracker(tracker)
 
 
-def get_settings(session_id: str) -> dict:
+def get_settings(owner: str) -> dict:
+    """owner: the logged-in username, or LOCAL_OWNER when auth is
+    disabled (see api.deps.get_current_user) - settings now follow the
+    account across browsers/devices, not one anonymous browser tab."""
     tracker = _load_tracker()
-    session = tracker.get("sessions", {}).get(session_id, {})
-    return {**_DEFAULT_SETTINGS, **session.get("settings", {})}
+    user = tracker.get("users", {}).get(owner, {})
+    return {**_DEFAULT_SETTINGS, **user.get("settings", {})}
 
 
-def set_settings(session_id: str, **updates) -> dict:
+def set_settings(owner: str, **updates) -> dict:
     with _tracker_lock():
         tracker = _load_tracker()
-        tracker = _ensure_session(tracker, session_id)
-        tracker["sessions"][session_id]["settings"].update(updates)
+        tracker = _ensure_user_record(tracker, owner)
+        tracker["users"][owner]["settings"].update(updates)
         _save_tracker(tracker)
-        return tracker["sessions"][session_id]["settings"]
+        return tracker["users"][owner]["settings"]
 
 
-def get_history(session_id: str, thread_key: str) -> list[dict]:
+def get_history(owner: str, thread_key: str) -> list[dict]:
     """
-    Return this session's conversation turns for one thread
+    Return this account's conversation turns for one thread
     (thread_key is a KB name for a Sources-page thread, or "__cross__"
     for the cross-KB Chat page - see module docstring), oldest first.
-    Empty list for a session/thread that has never had a turn appended.
+    Empty list for an account/thread that has never had a turn appended.
     """
     tracker = _load_tracker()
-    session = tracker.get("sessions", {}).get(session_id, {})
-    return session.get("history", {}).get(thread_key, [])
+    user = tracker.get("users", {}).get(owner, {})
+    return user.get("history", {}).get(thread_key, [])
 
 
-def append_history(session_id: str, thread_key: str, question: str, answer: str) -> None:
+def append_history(owner: str, thread_key: str, question: str, answer: str) -> None:
     """
     Record one completed question/answer turn for a thread, then trim
     to the last _MAX_HISTORY_TURNS turns (oldest dropped first). Called
@@ -273,19 +305,19 @@ def append_history(session_id: str, thread_key: str, question: str, answer: str)
     """
     with _tracker_lock():
         tracker = _load_tracker()
-        tracker = _ensure_session(tracker, session_id)
-        history = tracker["sessions"][session_id]["history"].setdefault(thread_key, [])
+        tracker = _ensure_user_record(tracker, owner)
+        history = tracker["users"][owner]["history"].setdefault(thread_key, [])
         history.append({"question": question, "answer": answer, "at": _now_iso()})
         del history[:-_MAX_HISTORY_TURNS]
         _save_tracker(tracker)
 
 
-def clear_history(session_id: str, thread_key: str) -> None:
-    """Empty one thread's history, leaving every other thread (and every other session) untouched."""
+def clear_history(owner: str, thread_key: str) -> None:
+    """Empty one thread's history, leaving every other thread (and every other account) untouched."""
     with _tracker_lock():
         tracker = _load_tracker()
-        session = tracker.get("sessions", {}).get(session_id)
-        if not session:
+        user = tracker.get("users", {}).get(owner)
+        if not user:
             return
-        session.setdefault("history", {})[thread_key] = []
+        user.setdefault("history", {})[thread_key] = []
         _save_tracker(tracker)

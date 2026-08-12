@@ -133,6 +133,12 @@ _SOURCE_TYPE_TO_KB = {
 # metadata.
 _DEFAULT_KB = "markdown"
 
+# Owner used when a chunk's metadata has no "owner" key at all (e.g.
+# hand-built test fixtures predating per-user ownership, or a caller
+# that hasn't been updated yet) - mirrors api.deps.LOCAL_OWNER's value
+# without importing from the api/ layer (this module sits below it).
+_DEFAULT_OWNER = "local"
+
 _client = None
 _collections: dict[str, object] = {}
 _image_collection = None
@@ -252,6 +258,15 @@ def add_embedded_chunks(chunks: list[EmbeddedChunk]) -> None:
             document_id = chunk.metadata.get("document_id") or chunk.metadata.get("file_name", "document")
             chunk_index = chunk.metadata.get("chunk_index", len(ids))
             page_number = chunk.metadata.get("page_number")
+            # Storage id is owner-prefixed so two owners' documents that
+            # happen to share a document_id (e.g. both upload a file
+            # called "report.pdf") never collide/overwrite each other -
+            # deliberately only the internal Chroma id, not the
+            # document_id metadata VALUE, which stays untouched since
+            # it's a user-visible display string (Sources list, chat
+            # toasts, evaluation fixtures) and is independently
+            # re-derived by app.graph.code_graph at graph-build time.
+            owner = chunk.metadata.get("owner", _DEFAULT_OWNER)
 
             # PDF chunks carry page_number (recovered from page markers -
             # see app.chunking.chunker._pack_section) even though chunk_index
@@ -261,13 +276,20 @@ def add_embedded_chunks(chunks: list[EmbeddedChunk]) -> None:
             # source that DOES restart chunk_index per page/unit remains
             # collision-safe too.
             if page_number is not None:
-                ids.append(f"{document_id}::page_{page_number}::chunk_{chunk_index}")
+                ids.append(f"{owner}::{document_id}::page_{page_number}::chunk_{chunk_index}")
             else:
-                ids.append(f"{document_id}::chunk_{chunk_index}")
+                ids.append(f"{owner}::{document_id}::chunk_{chunk_index}")
 
             embeddings.append(chunk.embedding)
             documents.append(chunk.content)
-            metadatas.append(_sanitize_metadata(chunk.metadata))
+            # owner is written back explicitly (not just used for the
+            # id above) so it's always a real, queryable metadata
+            # field on every stored chunk - including for chunks whose
+            # caller never set one, defaulting through to
+            # _DEFAULT_OWNER, so a where={"owner": ...} filter can
+            # never silently miss a chunk that simply never had the
+            # field at all.
+            metadatas.append(_sanitize_metadata({**chunk.metadata, "owner": owner}))
 
         # upsert: re-running ingestion on the same document overwrites the
         # same ids instead of creating duplicates.
@@ -334,7 +356,7 @@ def query_embedding(query_vector: list[float], top_k: int = 5, where: dict | Non
     return hits
 
 
-def sample_kb_embeddings(kb: str, limit: int = 40) -> list[list[float]]:
+def sample_kb_embeddings(kb: str, limit: int = 40, owner: str | None = None) -> list[list[float]]:
     """
     Return up to `limit` embeddings already stored in `kb`'s
     collection, chosen by random sample (not just the first N Chroma
@@ -351,11 +373,23 @@ def sample_kb_embeddings(kb: str, limit: int = 40) -> list[list[float]]:
     Chroma already stores each chunk's vector, so this is a plain
     fetch, not a re-embed.
 
-    Returns [] for an empty/unpopulated KB - the caller treats that
-    the same as any other KB with no semantic signal to offer.
+    owner is deliberately OPTIONAL and defaults to sampling across
+    EVERY owner: unlike every other owner-scoped function in this
+    module, this one never returns/discloses any chunk content - it
+    only nudges which KB a query gets ROUTED to (a soft signal, not a
+    content boundary). Fully owner-scoping it would require the same
+    (owner, kb)-keyed caching overhaul this module's BM25 index got
+    (see app.retrieval.hybrid_retriever) purely to prevent one owner's
+    ingested-topic mix from mildly influencing another owner's routing
+    scores - a real but low-severity gap, deliberately deferred rather
+    than expanding this change's blast radius for a non-disclosure risk.
+
+    Returns [] for an empty/unpopulated KB - the caller treats that the
+    same as any other KB with no semantic signal to offer.
     """
     collection = _get_collection(kb)
-    all_ids = collection.get(include=[])["ids"]
+    where = {"owner": owner} if owner is not None else None
+    all_ids = collection.get(where=where, include=[])["ids"]
     if not all_ids:
         return []
     sample_ids = random.sample(all_ids, min(limit, len(all_ids)))
@@ -375,7 +409,7 @@ def sample_kb_embeddings(kb: str, limit: int = 40) -> list[list[float]]:
     return [[float(x) for x in vector] for vector in embeddings]
 
 
-def get_table_chunk(table_id: str) -> dict | None:
+def get_table_chunk(table_id: str, owner: str) -> dict | None:
     """
     Fetch the whole-table chunk (content_type == "table") matching a
     given table_id, as opposed to any of its individual per-row chunks
@@ -388,7 +422,9 @@ def get_table_chunk(table_id: str) -> dict | None:
 
     Checks every text KB (the caller doesn't know in advance which KB a
     given table_id lives in - see module docstring) and returns the
-    first match.
+    first match. owner is checked independently of table_id (not just
+    relied upon via the id scheme) so two owners' tables can never
+    cross-resolve even if their table_id metadata happened to coincide.
 
     Returns:
         A dict with "content" and "metadata" (no "distance"/
@@ -397,7 +433,7 @@ def get_table_chunk(table_id: str) -> dict | None:
     """
     for collection in _iter_collections():
         result = collection.get(
-            where={"$and": [{"table_id": table_id}, {"content_type": "table"}]},
+            where={"$and": [{"table_id": table_id}, {"content_type": "table"}, {"owner": owner}]},
             limit=1,
         )
         if result["documents"]:
@@ -410,7 +446,7 @@ def get_table_chunk(table_id: str) -> dict | None:
     return None
 
 
-def get_class_chunk(class_id: str) -> dict | None:
+def get_class_chunk(class_id: str, owner: str) -> dict | None:
     """
     Fetch the whole-class chunk (content_type == "class") matching a
     given class_id, as opposed to any of its individual per-method
@@ -426,7 +462,8 @@ def get_class_chunk(class_id: str) -> dict | None:
 
     Checks every text KB, same as get_table_chunk() (class/method
     chunks only ever exist in the "github" KB today, but this avoids
-    silently breaking if that ever changes).
+    silently breaking if that ever changes). owner is checked
+    independently, same reasoning as get_table_chunk().
 
     Returns:
         A dict with "content" and "metadata" (no "distance"/
@@ -435,7 +472,7 @@ def get_class_chunk(class_id: str) -> dict | None:
     """
     for collection in _iter_collections():
         result = collection.get(
-            where={"$and": [{"class_id": class_id}, {"content_type": "class"}]},
+            where={"$and": [{"class_id": class_id}, {"content_type": "class"}, {"owner": owner}]},
             limit=1,
         )
         if result["documents"]:
@@ -461,21 +498,32 @@ def count(kb: str | None = None) -> int:
     return sum(collection.count() for collection in _iter_collections())
 
 
-def list_populated_kbs() -> list[str]:
+def list_populated_kbs(owner: str) -> list[str]:
     """
-    Every KB (see KB_NAMES) that has at least one chunk stored.
+    Every KB (see KB_NAMES) that has at least one chunk stored FOR
+    THIS OWNER.
 
     Used by app.retrieval.retriever as the default search scope when
     query routing (app.routing.router) finds no explicit KB signal in
     a query: rather than searching every KB unconditionally, it only
     searches the ones that actually have data - a KB nothing has ever
-    been ingested into is skipped for free, with no risk of missing
-    real results.
+    been ingested into (by this owner) is skipped for free, with no
+    risk of missing real results. Owner-scoped rather than using
+    count()'s global total, since a KB populated only by a DIFFERENT
+    owner shouldn't be treated as a real fallback target for this one -
+    Chroma's .count() has no `where` parameter, so this is a
+    get(where=...)-and-measure instead of the O(1) count() other
+    global stats use.
     """
-    return [kb for kb in KB_NAMES if count(kb) > 0]
+    populated = []
+    for kb in KB_NAMES:
+        ids = _get_collection(kb).get(where={"owner": owner}, include=[])["ids"]
+        if ids:
+            populated.append(kb)
+    return populated
 
 
-def get_chunk_by_document_id(document_id: str) -> dict | None:
+def get_chunk_by_document_id(document_id: str, owner: str) -> dict | None:
     """
     Fetch a single stored chunk by its exact document_id, as opposed
     to a similarity search - e.g. looking up the image_ocr/image_code
@@ -491,7 +539,8 @@ def get_chunk_by_document_id(document_id: str) -> dict | None:
 
     Checks every text KB (images are ingested from websites, so their
     derived text chunk lives in the "web" KB today, but this avoids
-    hard-coding that assumption here).
+    hard-coding that assumption here). owner is checked independently,
+    same reasoning as get_table_chunk().
 
     Returns:
         A dict with "content" and "metadata" (no "distance"/
@@ -499,7 +548,9 @@ def get_chunk_by_document_id(document_id: str) -> dict | None:
         if no chunk with that document_id exists.
     """
     for collection in _iter_collections():
-        result = collection.get(where={"document_id": document_id}, limit=1)
+        result = collection.get(
+            where={"$and": [{"document_id": document_id}, {"owner": owner}]}, limit=1
+        )
         if result["documents"]:
             return {
                 "content": result["documents"][0],
@@ -535,36 +586,38 @@ def get_chunks_by_content_type(content_type: str) -> list[dict]:
     return matches
 
 
-def list_repositories() -> list[str]:
+def list_repositories(owner: str) -> list[str]:
     """
-    Every distinct "owner/repo" value among stored chunks (see
-    app.ingestion.loader.load_github_repository's document_id/
+    Every distinct "owner/repo" value among THIS OWNER's stored chunks
+    (see app.ingestion.loader.load_github_repository's document_id/
     repository metadata), sorted alphabetically.
 
     Used by the UI/CLI to let a user pick which already-ingested
     repository to scope a question to (see retrieve()'s `repository`
     argument) - GitHub-sourced chunks all land in the "github" KB (see
     module docstring), but every text KB is checked here for
-    robustness rather than hard-coding that assumption.
+    robustness rather than hard-coding that assumption. Owner-scoped so
+    one account's repo-picker dropdown never reveals what repository
+    names another account has privately ingested.
 
     Returns:
-        An empty list if no GitHub repo has been ingested yet (chunks
-        with no "repository" metadata key, e.g. from PDFs/websites, are
-        not included).
+        An empty list if this owner hasn't ingested a GitHub repo yet
+        (chunks with no "repository" metadata key, e.g. from
+        PDFs/websites, are not included).
     """
     repositories: set[str] = set()
     for collection in _iter_collections():
-        result = collection.get(include=["metadatas"])
+        result = collection.get(where={"owner": owner}, include=["metadatas"])
         repositories.update(
             metadata.get("repository") for metadata in result["metadatas"] if metadata.get("repository")
         )
     return sorted(repositories)
 
 
-def list_documents(kb: str) -> list[dict]:
+def list_documents(kb: str, owner: str) -> list[dict]:
     """
-    Every distinct document currently stored in one KB, with its
-    stored chunk count.
+    Every distinct document currently stored in one KB FOR THIS OWNER,
+    with its stored chunk count.
 
     For kb="github", documents are grouped by `repository` (one row
     per ingested repo) rather than by individual file `document_id`,
@@ -574,7 +627,9 @@ def list_documents(kb: str) -> list[dict]:
 
     Used by the UI to show what's already indexed in a KB, as opposed
     to what's merely pending-in-this-session (see
-    data/pending_documents.json / ui.state).
+    data/pending_documents.json / ui.state). Owner-scoped so the
+    Sources page only ever lists documents this account itself
+    ingested.
 
     Returns:
         A list of {"id": str, "chunk_count": int} dicts, sorted by id.
@@ -582,7 +637,7 @@ def list_documents(kb: str) -> list[dict]:
         it's an "owner/repo" repository name.
     """
     collection = _get_collection(kb)
-    result = collection.get(include=["metadatas"])
+    result = collection.get(where={"owner": owner}, include=["metadatas"])
     group_field = "repository" if kb == "github" else "document_id"
     counts: dict[str, int] = {}
     for metadata in result["metadatas"]:
@@ -593,18 +648,25 @@ def list_documents(kb: str) -> list[dict]:
     return [{"id": doc_id, "chunk_count": n} for doc_id, n in sorted(counts.items())]
 
 
-def delete_document(document_id: str, kb: str | None = None) -> int:
+def delete_document(document_id: str, owner: str, kb: str | None = None) -> int:
     """
     Delete every chunk whose metadata `document_id` matches the given
-    value, PLUS any video frames / audio clips / saved media files
-    associated with it. Returns the number of TEXT chunks removed
-    (unchanged return contract for existing callers - frame/clip/file
-    cleanup counts are only logged, not returned).
+    value AND belongs to `owner`, PLUS any video frames / audio clips /
+    saved media files associated with it. Returns the number of TEXT
+    chunks removed (unchanged return contract for existing callers -
+    frame/clip/file cleanup counts are only logged, not returned).
 
     Args:
         document_id: The document_id metadata value written by the
             loader (e.g. the file path for PDF/DOCX/Markdown, the URL
             for a website page).
+        owner: Required - closes what was previously a real gap (any
+            session could delete any document regardless of who
+            ingested it). Checked as an independent `where` clause,
+            not inferred from the storage id, so a delete can never
+            cross owners even if document_id metadata happens to
+            coincide between two owners (e.g. both ingest a file
+            literally named "report.pdf").
         kb: Optional - if given, only delete from that specific KB
             (faster). If None, checks every KB (safer when the caller
             doesn't know which KB a document lives in).
@@ -625,7 +687,9 @@ def delete_document(document_id: str, kb: str | None = None) -> int:
     total_deleted = 0
     affected_kbs: set[str] = set()
     for collection in collections:
-        existing = collection.get(where={"document_id": document_id}, include=[])
+        existing = collection.get(
+            where={"$and": [{"document_id": document_id}, {"owner": owner}]}, include=[]
+        )
         ids = existing["ids"]
         if ids:
             collection.delete(ids=ids)
@@ -635,7 +699,7 @@ def delete_document(document_id: str, kb: str | None = None) -> int:
                 if coll_name == collection.name:
                     affected_kbs.add(kb_name)
     if total_deleted:
-        logger.info("Deleted %d chunk(s) for document_id=%r", total_deleted, document_id)
+        logger.info("Deleted %d chunk(s) for document_id=%r owner=%r", total_deleted, document_id, owner)
     for affected_kb in affected_kbs:
         _invalidate_hybrid_cache(affected_kb)
 
@@ -645,14 +709,16 @@ def delete_document(document_id: str, kb: str | None = None) -> int:
     # A document is never both, so both filters are checked, not just one.
     image_collection = _get_image_collection()
     for field in ("video_document_id", "page_url"):
-        existing = image_collection.get(where={field: document_id}, include=[])
+        existing = image_collection.get(where={"$and": [{field: document_id}, {"owner": owner}]}, include=[])
         ids = existing["ids"]
         if ids:
             image_collection.delete(ids=ids)
             logger.info("Deleted %d image chunk(s) (%s=%r)", len(ids), field, document_id)
 
     audio_collection = _get_audio_clip_collection()
-    existing = audio_collection.get(where={"document_id": document_id}, include=[])
+    existing = audio_collection.get(
+        where={"$and": [{"document_id": document_id}, {"owner": owner}]}, include=[]
+    )
     ids = existing["ids"]
     if ids:
         audio_collection.delete(ids=ids)
@@ -660,16 +726,18 @@ def delete_document(document_id: str, kb: str | None = None) -> int:
 
     from app.media.media_store import delete_media_for_document
 
-    delete_media_for_document(document_id)
+    delete_media_for_document(document_id, owner)
 
     return total_deleted
 
 
-def delete_repository(repository: str) -> int:
+def delete_repository(repository: str, owner: str) -> int:
     """
     Delete every chunk whose metadata `repository` matches the given
-    "owner/repo" value (see app.ingestion.loader.load_github_repository).
-    Returns the number of chunks removed.
+    "owner/repo" value (see app.ingestion.loader.load_github_repository)
+    AND belongs to `owner` (the local account, not to be confused with
+    the "owner" half of the GitHub "owner/repo" string). Returns the
+    number of chunks removed.
 
     Only the "github" KB is checked, because that's the only KB
     GitHub-sourced chunks are ever written to (see module docstring's
@@ -677,11 +745,11 @@ def delete_repository(repository: str) -> int:
     `repository` metadata key.
     """
     collection = _get_collection("github")
-    existing = collection.get(where={"repository": repository}, include=[])
+    existing = collection.get(where={"$and": [{"repository": repository}, {"owner": owner}]}, include=[])
     ids = existing["ids"]
     if ids:
         collection.delete(ids=ids)
-        logger.info("Deleted %d chunk(s) for repository=%r", len(ids), repository)
+        logger.info("Deleted %d chunk(s) for repository=%r owner=%r", len(ids), repository, owner)
         _invalidate_hybrid_cache("github")
     return len(ids)
 
@@ -706,21 +774,31 @@ def add_image_chunks(image_chunks: list[dict]) -> None:
     collection = _get_image_collection()
 
     # Chroma's upsert() rejects duplicate ids within a single call (it only
-    # upserts-across-calls, not within one) - dedupe by image_url first, in
-    # case the same image URL appears more than once on the same page (e.g.
-    # the same icon reused inline and in a gallery), keeping the last one.
-    by_url: dict[str, dict] = {image_chunk["metadata"]["image_url"]: image_chunk for image_chunk in image_chunks}
+    # upserts-across-calls, not within one) - dedupe by (owner, image_url)
+    # first, in case the same image URL appears more than once on the same
+    # page (e.g. the same icon reused inline and in a gallery), keeping the
+    # last one. Keyed on the PAIR, not bare image_url: the stored id is
+    # itself owner-prefixed (see below), so two different owners saving the
+    # same public image URL in the same batch call must both survive, not
+    # silently collapse into whichever happened to be processed last.
+    by_owner_url: dict[tuple[str, str], dict] = {
+        (image_chunk["metadata"].get("owner", _DEFAULT_OWNER), image_chunk["metadata"]["image_url"]): image_chunk
+        for image_chunk in image_chunks
+    }
 
     ids: list[str] = []
     embeddings: list[list[float]] = []
     documents: list[str] = []
     metadatas: list[dict] = []
 
-    for image_url, image_chunk in by_url.items():
-        ids.append(image_url)
+    for (owner, image_url), image_chunk in by_owner_url.items():
+        # Owner-prefixed for the same collision reason as
+        # add_embedded_chunks() - two owners saving the same public
+        # image URL would otherwise overwrite each other's chunk.
+        ids.append(f"{owner}::{image_url}")
         embeddings.append(image_chunk["embedding"])
         documents.append(image_chunk["content"])
-        metadatas.append(_sanitize_metadata(image_chunk["metadata"]))
+        metadatas.append(_sanitize_metadata({**image_chunk["metadata"], "owner": owner}))
 
     collection.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
     logger.info("Stored/updated %d image chunk(s) in collection '%s'", len(ids), IMAGE_COLLECTION_NAME)
@@ -804,11 +882,12 @@ def add_audio_clip_chunks(clip_chunks: list[dict]) -> None:
 
     for clip_chunk in clip_chunks:
         metadata = clip_chunk["metadata"]
-        clip_id = f"{metadata['document_id']}::clip_{metadata['start_seconds']}"
+        owner = metadata.get("owner", _DEFAULT_OWNER)
+        clip_id = f"{owner}::{metadata['document_id']}::clip_{metadata['start_seconds']}"
         ids.append(clip_id)
         embeddings.append(clip_chunk["embedding"])
         documents.append(clip_chunk["content"])
-        metadatas.append(_sanitize_metadata(metadata))
+        metadatas.append(_sanitize_metadata({**metadata, "owner": owner}))
 
     collection.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
     logger.info("Stored/updated %d audio clip(s) in collection '%s'", len(ids), AUDIO_CLIP_COLLECTION_NAME)

@@ -34,7 +34,7 @@ from app.routing.router import classify_route
 from app.vectorstore.store import list_populated_kbs
 from cli import ask_with_vision_stream
 
-from api.deps import get_session_id
+from api.deps import get_current_user
 from insight import build_insight
 from session_store import append_history, clear_history, get_history, get_settings
 
@@ -67,8 +67,8 @@ def _sse(payload: dict) -> str:
 
 
 @router.post("/stream")
-def chat_stream(body: ChatRequest, session_id: str = Depends(get_session_id)):
-    settings = get_settings(session_id)
+def chat_stream(body: ChatRequest, owner: str = Depends(get_current_user)):
+    settings = get_settings(owner)
     top_k = settings["top_k"]
     use_vision = settings["use_vision"]
     crag_enabled = settings["crag_enabled"]
@@ -79,7 +79,7 @@ def chat_stream(body: ChatRequest, session_id: str = Depends(get_session_id)):
     kb = body.kb
     repository = body.repository
     thread_key = _thread_key(kb)
-    history = get_history(session_id, thread_key)
+    history = get_history(owner, thread_key)
 
     logger.info("chat question kb=%s: %r", kb, question)
 
@@ -87,7 +87,7 @@ def chat_stream(body: ChatRequest, session_id: str = Depends(get_session_id)):
     # exact same decision the retriever made internally - mirrors the
     # Streamlit build's render_kb_chat/render_cross_kb_chat.
     decision = classify_route(question)
-    target_kbs = [kb] if kb else (decision.kbs or list_populated_kbs())
+    target_kbs = [kb] if kb else (decision.kbs or list_populated_kbs(owner))
     # Not just "kb == 'github'" (explicitly-scoped chat) - a cross-KB
     # question (kb=None) can still route to "github" as one of several
     # target_kbs, and app.retrieval.retriever.retrieve() now dispatches
@@ -100,7 +100,7 @@ def chat_stream(body: ChatRequest, session_id: str = Depends(get_session_id)):
     def event_stream():
         token_iter, image_hits, chunks, crag_result, contextualization, used_semantic_cache, audio_clip_hits = ask_with_vision_stream(
             question, top_k=top_k, use_vision=use_vision, kb=kb, repository=repository,
-            crag_enabled=crag_enabled, query_transform_enabled=query_transform_enabled,
+            owner=owner, crag_enabled=crag_enabled, query_transform_enabled=query_transform_enabled,
             self_rag_enabled=self_rag_enabled,
             history=history, conversation_memory_enabled=conversation_memory_enabled,
         )
@@ -114,7 +114,7 @@ def chat_stream(body: ChatRequest, session_id: str = Depends(get_session_id)):
         # client that disconnects mid-stream never leaves a partial/
         # empty answer in this thread's remembered history.
         if answer:
-            append_history(session_id, thread_key, question, answer)
+            append_history(owner, thread_key, question, answer)
 
         # Self-RAG runs AFTER streaming so first-token latency is
         # unaffected. cli.py's streaming tail already warmed the
@@ -178,9 +178,9 @@ def chat_stream(body: ChatRequest, session_id: str = Depends(get_session_id)):
 
 
 @router.post("/clear")
-def clear_chat_history(body: ClearHistoryRequest, session_id: str = Depends(get_session_id)):
+def clear_chat_history(body: ClearHistoryRequest, owner: str = Depends(get_current_user)):
     """Empty one thread's remembered conversation (see _thread_key) -
     used by the webapp's "Clear conversation" button. Does not touch
-    any other thread or session."""
-    clear_history(session_id, _thread_key(body.kb))
+    any other account's history."""
+    clear_history(owner, _thread_key(body.kb))
     return {"cleared": True}
